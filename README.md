@@ -36,3 +36,32 @@ Per farlo, prima si esegue tutto il codcie decommentando la cella 3 ed eseguendo
 ## Autore
 
 Matteo Aruta
+
+## Plot della soluzione
+
+È disponibile uno script di utilità `plot_solution.py` per visualizzare gli snapshot della soluzione.
+
+Esempi:
+
+ - Usare la prima traiettoria Dynabench caricata da `esperimento.crea_esperimento()` e mostrare il frame 10:
+
+```bash
+python plot_solution.py --index 10
+```
+
+ - Caricare un file HDF5 Dynabench e salvare la figura del frame 5:
+
+```bash
+python plot_solution.py --input data/advection/cloud/low/advection_test_cloud_low_0_499.h5 --index 5 --out snapshot5.png
+```
+
+ - Specificare un tempo reale invece dell'indice (trova lo snapshot più vicino):
+
+```bash
+python plot_solution.py --input snapshots.npz --time 50.0
+```
+
+Requisiti aggiuntivi:
+
+- `matplotlib`
+- `h5py` (solo se si vogliono aprire file .h5)

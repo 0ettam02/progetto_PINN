@@ -4,3 +4,5 @@ pandas
 numpy
 scikit-learn
 matplotlib
+torch
+h5py
