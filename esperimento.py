@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import argparse
+import csv
+import math
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
-import h5py
 import numpy as np
 import torch
+from dynabench.dataset import DynabenchIterator
+from dynabench.grid import Grid
+
+from pinn import PINN
 
 
 @dataclass(frozen=True)
@@ -14,7 +22,8 @@ class ConfigurazioneEsperimento:
     equation: str = "advection"
     structure: str = "cloud"
     resolution: str = "low"
-    split: str = "train"
+    lookback: int = 1
+    rollout: int = 16
     t0: float = 0.0
     t_finale: float = 200.0
     dt: float = 1.0
@@ -22,431 +31,628 @@ class ConfigurazioneEsperimento:
     velocita_y: float = 1.0
     hidden_dim: int = 64
     num_layers: int = 4
-    dropout: float = 0.05
+    dropout: float = 0.0
     learning_rate: float = 1e-3
     weight_decay: float = 1e-6
     numero_valutazioni_training: int = 5000
-    numero_punti_l2: int = 4096
-    batch_traiettorie_data: int = 4
-    batch_tempi_data: int = 4
-    batch_traiettorie_fisica: int = 2
-    batch_tempi_fisica: int = 3
-    batch_intervalli_dmd: int = 4
-    lambda_data: float = 0.0
+    batch_size: int = 4
+    batch_size_dmd: int = 16
+    dmd_punti_per_snapshot: int | None = 100
+    batch_validation: int = 8
+    validation_batches: int = 8
+    lambda_data: float = 1.0
     lambda_fisica: float = 0.0
-    lambda_dmd: float = 1.0
+    lambda_dmd: float = 0.0
     seed: int = 42
-    device: str = "cpu"
+    device: str = "auto"
+    dmd_operator_path: str | None = "results/per_sim_final"
+    download: bool = False
+    clip_grad_norm: float | None = 1.0
+    dmd_cache_size: int = 10
 
 
-def aggiungi_dropout_al_modello(
-    modello: torch.nn.Module,
-    probabilita: float,
-) -> torch.nn.Module:
-    if probabilita < 0.0 or probabilita >= 1.0:
-        raise ValueError("dropout deve essere in [0, 1).")
-    if probabilita == 0.0:
-        return modello
-    if not hasattr(modello, "net") or not isinstance(modello.net, torch.nn.Sequential):
-        raise TypeError("Il modello deve esporre una rete torch.nn.Sequential in .net.")
-
-    layers = []
-    for layer in modello.net:
-        layers.append(layer)
-        if isinstance(layer, torch.nn.Tanh):
-            layers.append(torch.nn.Dropout(p=probabilita))
-    modello.net = torch.nn.Sequential(*layers)
-    return modello
+@dataclass
+class BatchRollout:
+    u0: torch.Tensor
+    target: torch.Tensor
+    pos: torch.Tensor
+    tempi_rollout: torch.Tensor
+    indici_iterator: np.ndarray
+    indici_simulazione: np.ndarray
+    indici_temporali: np.ndarray
 
 
-class DatasetDynabenchAvvezione:
-    """
-    Lettore lazy per Dynabench advection.
+@dataclass
+class DMDRecord:
+    matrix: np.ndarray
+    norm_min: float | None = None
+    norm_max: float | None = None
+    pts: np.ndarray | None = None
 
-    I file locali hanno la struttura:
-    data   -> (traiettorie, 201, 225, 1)
-    points -> (traiettorie, 225, 2)
 
-    I tempi data sono t_i = 0, 1, ..., 200. Gli intervalli DMD sono i
-    200 intervalli centrati in t_i + 0.5.
-    """
+@dataclass
+class DMDTensors:
+    matrix: torch.Tensor
+    norm_min: torch.Tensor | None = None
+    norm_max: torch.Tensor | None = None
+    pts: torch.Tensor | None = None
 
-    def __init__(self, configurazione: ConfigurazioneEsperimento):
+
+def risolvi_device(device: str) -> torch.device:
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device)
+
+
+def normalizza_tempo(tempi: torch.Tensor, configurazione: ConfigurazioneEsperimento) -> torch.Tensor:
+    scala = configurazione.t_finale - configurazione.t0
+    if scala <= 0:
+        raise ValueError("t_finale deve essere maggiore di t0.")
+    return (tempi - configurazione.t0) / scala
+
+
+class DynabenchRolloutDataset:
+    """Wrapper leggero attorno a DynabenchIterator per finestre (1, 16)."""
+
+    def __init__(self, configurazione: ConfigurazioneEsperimento, split: str):
         self.configurazione = configurazione
-        directory = (
-            Path(configurazione.data_root)
-            / configurazione.equation
-            / configurazione.structure
-            / configurazione.resolution
+        self.split = split
+        self.iterator = DynabenchIterator(
+            split=split,
+            equation=configurazione.equation,
+            structure=configurazione.structure,
+            resolution=configurazione.resolution,
+            base_path=configurazione.data_root,
+            lookback=configurazione.lookback,
+            rollout=configurazione.rollout,
+            squeeze_lookback_dim=False,
+            download=configurazione.download,
+            dtype=np.float32,
         )
-        pattern = (
-            f"{configurazione.equation}_{configurazione.split}_"
-            f"{configurazione.structure}_{configurazione.resolution}_*.h5"
-        )
-        self.paths = sorted(directory.glob(pattern))
-        if not self.paths:
-            raise FileNotFoundError(
-                f"Nessun file Dynabench trovato con pattern {directory / pattern}"
+        if len(self.iterator) == 0:
+            raise RuntimeError(f"DynabenchIterator vuoto per split={split!r}.")
+
+        sample = self.iterator[0]
+        if sample.x.ndim != 3 or sample.y.ndim != 3 or sample.pos.ndim != 2:
+            raise ValueError(
+                "Questo esperimento si aspetta cloud data con x=(L,K,F), "
+                "y=(R,K,F), pos=(K,2)."
             )
+        if sample.x.shape[0] != configurazione.lookback:
+            raise ValueError("lookback del sample non coerente con la configurazione.")
+        if sample.y.shape[0] != configurazione.rollout:
+            raise ValueError("rollout del sample non coerente con la configurazione.")
+        if sample.x.shape[-1] != 1 or sample.y.shape[-1] != 1:
+            raise ValueError("L'esperimento advection qui usa una sola variabile scalare.")
 
-        self._handles: dict[int, h5py.File] = {}
-        self.traiettorie_per_file: list[int] = []
-        self._starts = [0]
+        self.numero_punti = int(sample.pos.shape[0])
+        self.numero_variabili = int(sample.x.shape[-1])
+        lato = int(round(math.sqrt(self.numero_punti)))
+        if lato * lato != self.numero_punti:
+            raise ValueError("Per low/cloud ci si aspetta un numero quadrato di punti.")
 
-        n_tempi = None
-        n_punti = None
-        n_variabili = None
-        for path in self.paths:
-            with h5py.File(path, "r") as file:
-                data_shape = file["data"].shape
-                points_shape = file["points"].shape
-
-            if len(data_shape) != 4 or len(points_shape) != 3:
-                raise ValueError(f"Struttura HDF5 non supportata in {path}.")
-            if data_shape[0] != points_shape[0] or data_shape[2] != points_shape[1]:
-                raise ValueError(f"Shape incompatibili tra data e points in {path}.")
-
-            if n_tempi is None:
-                n_tempi = data_shape[1]
-                n_punti = data_shape[2]
-                n_variabili = data_shape[3]
-            elif (n_tempi, n_punti, n_variabili) != data_shape[1:]:
-                raise ValueError(f"Shape data non omogenea in {path}.")
-
-            self.traiettorie_per_file.append(data_shape[0])
-            self._starts.append(self._starts[-1] + data_shape[0])
-
-        self.numero_tempi = int(n_tempi)
-        self.numero_punti_spaziali = int(n_punti)
-        self.numero_variabili = int(n_variabili)
-        self.numero_traiettorie = self._starts[-1]
-        self.numero_rollback = self.numero_traiettorie * (self.numero_tempi - 1)
-        self.tempi_data = (
-            configurazione.t0
-            + configurazione.dt * np.arange(self.numero_tempi, dtype=np.float32)
+        self.griglia_dominio = Grid(
+            grid_size=(lato, lato),
+            grid_limits=((0.0, 1.0), (0.0, 1.0)),
         )
-        self.tempi_dmd = self.tempi_data[:-1] + 0.5 * configurazione.dt
+        self.offset_simulazioni = np.cumsum(self.iterator.number_of_simulations) - self.iterator.number_of_simulations[0]
+        self._controlla_punti_nel_dominio(sample.pos)
 
-        if not np.isclose(self.tempi_data[0], configurazione.t0):
-            raise ValueError("Il primo tempo del dataset non coincide con t0.")
-        if not np.isclose(self.tempi_data[-1], configurazione.t_finale):
-            raise ValueError("Il dataset non copre l'intervallo temporale richiesto.")
+    def __len__(self) -> int:
+        return len(self.iterator)
 
-    def close(self) -> None:
-        for handle in self._handles.values():
-            handle.close()
-        self._handles.clear()
+    def _controlla_punti_nel_dominio(self, pos: np.ndarray) -> None:
+        x_lim, y_lim = self.griglia_dominio.grid_limits
+        eps = 1e-6
+        if (
+            np.min(pos[:, 0]) < x_lim[0] - eps
+            or np.max(pos[:, 0]) > x_lim[1] + eps
+            or np.min(pos[:, 1]) < y_lim[0] - eps
+            or np.max(pos[:, 1]) > y_lim[1] + eps
+        ):
+            raise ValueError("I punti cloud Dynabench non cadono nel dominio [0,1]x[0,1].")
 
-    def _handle(self, indice_file: int) -> h5py.File:
-        if indice_file not in self._handles:
-            self._handles[indice_file] = h5py.File(self.paths[indice_file], "r")
-        return self._handles[indice_file]
+    def punti_dmd_da_griglia(self) -> np.ndarray:
+        xx, yy = self.griglia_dominio.get_meshgrid()
+        return np.column_stack([xx.reshape(-1), yy.reshape(-1)]).astype(np.float32)
 
-    def _mappa_traiettoria(self, indice_globale: int) -> tuple[int, int]:
-        indice_file = int(np.searchsorted(self._starts[1:], indice_globale, side="right"))
-        indice_locale = indice_globale - self._starts[indice_file]
-        return indice_file, int(indice_locale)
+    def decodifica_indice(self, index: int) -> tuple[int, int, int, int]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError("Index fuori range.")
 
-    def campiona_snapshot(
+        starting = np.asarray(self.iterator.starting_indices)
+        indice_file = int(np.searchsorted(starting, index, side="right") - 1)
+        raw_idx = int(index - starting[indice_file])
+        usable_len = int(self.iterator.usable_simulation_lengths[indice_file])
+        indice_sim_locale = raw_idx // usable_len
+        indice_temporale = raw_idx % usable_len
+        indice_sim_globale = int(self.offset_simulazioni[indice_file] + indice_sim_locale)
+        return indice_file, int(indice_sim_locale), int(indice_temporale), indice_sim_globale
+
+    def sample_batch(
         self,
         rng: np.random.Generator,
-        numero_traiettorie: int,
-        numero_tempi: int,
+        batch_size: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Campiona punti data/fisica sui tempi interi t_i = 0, 1, ..., 200.
+    ) -> BatchRollout:
+        indici = rng.integers(0, len(self), size=batch_size, endpoint=False)
 
-        Per ogni traiettoria e tempo campionati usa tutti i punti spaziali
-        disponibili nel cloud Dynabench, cioe tutti i 225 punti della soluzione.
-        """
-        coords = []
-        valori = []
-        indici_traiettoria = rng.integers(
-            0,
-            self.numero_traiettorie,
-            size=numero_traiettorie,
-            endpoint=False,
+        u0_list: list[np.ndarray] = []
+        target_list: list[np.ndarray] = []
+        pos_list: list[np.ndarray] = []
+        tempi_list: list[np.ndarray] = []
+        sim_indices: list[int] = []
+        time_indices: list[int] = []
+
+        for indice in indici:
+            _, _, indice_temporale, indice_sim_globale = self.decodifica_indice(int(indice))
+            item = self.iterator[int(indice)]
+            self._controlla_punti_nel_dominio(item.pos)
+
+            u0_list.append(np.asarray(item.x[:, :, 0].T, dtype=np.float32))
+            target_list.append(np.asarray(item.y[:, :, 0], dtype=np.float32))
+            pos_list.append(np.asarray(item.pos, dtype=np.float32))
+
+            tempi = (
+                self.configurazione.t0
+                + self.configurazione.dt
+                * (
+                    indice_temporale
+                    + self.configurazione.lookback
+                    + np.arange(self.configurazione.rollout, dtype=np.float32)
+                )
+            )
+            tempi_list.append(tempi.astype(np.float32))
+            sim_indices.append(indice_sim_globale)
+            time_indices.append(indice_temporale)
+
+        return BatchRollout(
+            u0=torch.as_tensor(np.stack(u0_list), device=device, dtype=dtype),
+            target=torch.as_tensor(np.stack(target_list), device=device, dtype=dtype),
+            pos=torch.as_tensor(np.stack(pos_list), device=device, dtype=dtype),
+            tempi_rollout=torch.as_tensor(np.stack(tempi_list), device=device, dtype=dtype),
+            indici_iterator=np.asarray(indici, dtype=np.int64),
+            indici_simulazione=np.asarray(sim_indices, dtype=np.int64),
+            indici_temporali=np.asarray(time_indices, dtype=np.int64),
         )
 
-        for indice_globale in indici_traiettoria:
-            indice_file, indice_locale = self._mappa_traiettoria(int(indice_globale))
-            file = self._handle(indice_file)
-            punti = np.asarray(file["points"][indice_locale], dtype=np.float32)
-            indici_tempo = rng.integers(
-                0,
-                self.numero_tempi,
-                size=numero_tempi,
-                endpoint=False,
+
+class DMDOperatorProvider:
+    def __init__(self, source: Any = None, cache_size: int = 32):
+        self.source = source
+        self.cache_size = cache_size
+        self._cache: OrderedDict[int, DMDRecord] = OrderedDict()
+        self._fixed_record: DMDRecord | None = None
+        self._directory: Path | None = None
+        self._missing_path: Path | None = None
+
+        if source is None:
+            return
+        if isinstance(source, (np.ndarray, torch.Tensor)):
+            matrix = source.detach().cpu().numpy() if isinstance(source, torch.Tensor) else source
+            self._fixed_record = DMDRecord(matrix=self._as_float_array(matrix))
+            return
+
+        path = Path(source)
+        if not path.exists():
+            self._missing_path = path
+            return
+        if path.is_dir():
+            if not any(path.glob("*.npz")):
+                self._missing_path = path
+                return
+            self._directory = path
+            return
+        self._fixed_record = self._load_record_from_file(path)
+
+    @property
+    def has_operator(self) -> bool:
+        return self._fixed_record is not None or self._directory is not None
+
+    @property
+    def missing_path(self) -> Path | None:
+        return self._missing_path
+
+    @property
+    def directory(self) -> Path | None:
+        return self._directory
+
+    def operator_count(self) -> int:
+        if self._directory is None:
+            return 1 if self._fixed_record is not None else 0
+        return len(list(self._directory.glob("*sim*.npz")))
+
+    def get_for_batch(
+        self,
+        batch: BatchRollout,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> DMDTensors:
+        if self._fixed_record is not None:
+            return self._record_to_tensors(self._fixed_record, device, dtype)
+        if self._directory is None:
+            raise ValueError(
+                "lambda_dmd e' diverso da zero, ma nessun dmd_operator e' stato fornito."
             )
 
-            for indice_tempo in indici_tempo:
-                tempo = self.tempi_data[indice_tempo]
-                soluzione = np.asarray(
-                    file["data"][indice_locale, indice_tempo, :, 0],
-                    dtype=np.float32,
-                )
-                tempo_colonna = np.full(
-                    (self.numero_punti_spaziali, 1),
-                    tempo,
-                    dtype=np.float32,
-                )
-                coords.append(np.concatenate([punti, tempo_colonna], axis=1))
-                valori.append(soluzione.reshape(-1, 1))
-
-        x = torch.as_tensor(np.vstack(coords), device=device, dtype=dtype)
-        y = torch.as_tensor(np.vstack(valori), device=device, dtype=dtype)
-        return x, y
-
-    def campiona_punti_l2(
-        self,
-        rng: np.random.Generator,
-        numero_punti: int,
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        numero_punti = max(1001, numero_punti)
-        numero_blocchi = int(np.ceil(numero_punti / self.numero_punti_spaziali))
-        x, y = self.campiona_snapshot(
-            rng=rng,
-            numero_traiettorie=numero_blocchi,
-            numero_tempi=1,
+        records = [self._load_record_for_simulation(int(i)) for i in batch.indici_simulazione]
+        matrix = torch.as_tensor(
+            np.stack([record.matrix for record in records]),
             device=device,
             dtype=dtype,
         )
-        return x[:numero_punti], y[:numero_punti]
 
-    def prima_traiettoria(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        file = self._handle(0)
-        tempi = self.tempi_data.copy()
-        snapshot = np.asarray(file["data"][0, :, :, 0], dtype=np.float32)
-        punti = np.asarray(file["points"][0], dtype=np.float32)
-        return tempi, snapshot, punti
+        norm_min = self._stack_optional_scalars(records, "norm_min", device, dtype)
+        norm_max = self._stack_optional_scalars(records, "norm_max", device, dtype)
+        pts = None
+        if all(record.pts is not None for record in records):
+            pts = torch.as_tensor(
+                np.stack([record.pts for record in records if record.pts is not None]),
+                device=device,
+                dtype=dtype,
+            )
+        return DMDTensors(matrix=matrix, norm_min=norm_min, norm_max=norm_max, pts=pts)
 
+    def _stack_optional_scalars(
+        self,
+        records: list[DMDRecord],
+        field: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        values = [getattr(record, field) for record in records]
+        if any(value is None for value in values):
+            return None
+        return torch.as_tensor(values, device=device, dtype=dtype)
 
-def crea_griglia_spaziale_dmd(numero_punti: int) -> np.ndarray:
-    lato = int(round(np.sqrt(numero_punti)))
-    if lato * lato != numero_punti:
-        raise ValueError(
-            "Per costruire la griglia DMD serve un numero quadrato di punti."
+    def _load_record_for_simulation(self, indice_simulazione: int) -> DMDRecord:
+        if indice_simulazione in self._cache:
+            record = self._cache.pop(indice_simulazione)
+            self._cache[indice_simulazione] = record
+            return record
+
+        if self._directory is None:
+            raise RuntimeError("Directory DMD non configurata.")
+
+        candidates = sorted(self._directory.glob(f"*sim{indice_simulazione:05d}.npz"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"Nessun operatore DMD trovato per sim {indice_simulazione:05d} "
+                f"in {self._directory}"
+            )
+
+        record = self._load_record_from_file(candidates[0])
+        self._cache[indice_simulazione] = record
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return record
+
+    def _record_to_tensors(
+        self,
+        record: DMDRecord,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> DMDTensors:
+        matrix = torch.as_tensor(record.matrix, device=device, dtype=dtype)
+        norm_min = (
+            torch.as_tensor(record.norm_min, device=device, dtype=dtype)
+            if record.norm_min is not None
+            else None
         )
+        norm_max = (
+            torch.as_tensor(record.norm_max, device=device, dtype=dtype)
+            if record.norm_max is not None
+            else None
+        )
+        pts = (
+            torch.as_tensor(record.pts, device=device, dtype=dtype)
+            if record.pts is not None
+            else None
+        )
+        return DMDTensors(matrix=matrix, norm_min=norm_min, norm_max=norm_max, pts=pts)
 
-    coordinate = (np.arange(lato, dtype=np.float32) + 0.5) / lato
-    xx, yy = np.meshgrid(coordinate, coordinate, indexing="ij")
-    return np.column_stack([xx.reshape(-1), yy.reshape(-1)]).astype(np.float32)
+    def _load_record_from_file(self, path: Path) -> DMDRecord:
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+        suffix = path.suffix.lower()
+        if suffix == ".npz":
+            with np.load(path) as data:
+                matrix = self._first_present(data, ["A", "dmd_operator", "dmd_operatore", "operator", "matrix", "arr_0"])
+                norm_min = self._optional_scalar(data, "norm_min")
+                norm_max = self._optional_scalar(data, "norm_max")
+                pts = self._as_float_array(data["pts"]) if "pts" in data else None
+            return DMDRecord(
+                matrix=self._as_float_array(matrix),
+                norm_min=norm_min,
+                norm_max=norm_max,
+                pts=pts,
+            )
+        if suffix == ".npy":
+            return DMDRecord(matrix=self._as_float_array(np.load(path)))
+        if suffix in {".csv", ".txt"}:
+            return DMDRecord(matrix=self._as_float_array(np.loadtxt(path, delimiter=",")))
+        if suffix in {".pt", ".pth"}:
+            loaded = torch.load(path, map_location="cpu")
+            if isinstance(loaded, torch.Tensor):
+                return DMDRecord(matrix=self._as_float_array(loaded))
+            if isinstance(loaded, dict):
+                matrix = self._first_present(loaded, ["A", "dmd_operator", "dmd_operatore", "operator", "matrix"])
+                norm_min = self._optional_scalar(loaded, "norm_min")
+                norm_max = self._optional_scalar(loaded, "norm_max")
+                pts = loaded.get("pts")
+                pts_np = self._as_float_array(pts) if pts is not None else None
+                return DMDRecord(
+                    matrix=self._as_float_array(matrix),
+                    norm_min=norm_min,
+                    norm_max=norm_max,
+                    pts=pts_np,
+                )
+        raise ValueError(f"Formato operatore DMD non supportato: {path}")
+
+    def _as_float_array(self, value: Any) -> np.ndarray:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        array = np.asarray(value)
+        if np.iscomplexobj(array):
+            array = array.real
+        return array.astype(np.float32)
+
+    def _first_present(self, container: Any, keys: list[str]) -> Any:
+        for key in keys:
+            if key in container:
+                return container[key]
+        raise KeyError(f"Nessuna delle chiavi {keys} e' presente nell'operatore DMD.")
+
+    def _optional_scalar(self, container: Any, key: str) -> float | None:
+        if key not in container:
+            return None
+        value = container[key]
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        return float(np.asarray(value).reshape(-1)[0])
 
 
-def coordinate_spazio_tempo(
-    punti_spaziali: torch.Tensor,
-    tempi: torch.Tensor,
-) -> torch.Tensor:
-    numero_tempi = tempi.numel()
-    numero_punti = punti_spaziali.shape[0]
-    punti = punti_spaziali.unsqueeze(0).expand(numero_tempi, numero_punti, 2)
-    colonna_tempi = tempi.reshape(-1, 1, 1).expand(numero_tempi, numero_punti, 1)
-    return torch.cat([punti, colonna_tempi], dim=-1).reshape(-1, 3)
-
-
-def campiona_batch_dmd(
-    dataset: DatasetDynabenchAvvezione,
-    punti_spaziali_dmd: torch.Tensor,
-    rng: np.random.Generator,
+def costruisci_feature_rollout(
+    batch: BatchRollout,
     configurazione: ConfigurazioneEsperimento,
-) -> dict[str, torch.Tensor | int]:
-    indici = rng.integers(
-        0,
-        dataset.numero_tempi - 1,
-        size=configurazione.batch_intervalli_dmd,
-        endpoint=False,
-    )
-    device = punti_spaziali_dmd.device
-    tempi_iniziali = torch.as_tensor(
-        dataset.tempi_data[indici],
-        device=device,
-        dtype=punti_spaziali_dmd.dtype,
-    )
-    tempi_finali = tempi_iniziali + configurazione.dt
-    tempi_mezzi = tempi_iniziali + 0.5 * configurazione.dt
-
-    return {
-        "x_iniziali": coordinate_spazio_tempo(punti_spaziali_dmd, tempi_iniziali),
-        "x_finali": coordinate_spazio_tempo(punti_spaziali_dmd, tempi_finali),
-        "x_mezzi": coordinate_spazio_tempo(punti_spaziali_dmd, tempi_mezzi),
-        "numero_intervalli": len(indici),
-        "numero_punti": punti_spaziali_dmd.shape[0],
-    }
+    require_grad: bool = False,
+) -> torch.Tensor:
+    batch_size, rollout, numero_punti = batch.target.shape
+    pos = batch.pos[:, None, :, :].expand(batch_size, rollout, numero_punti, 2)
+    tempo = normalizza_tempo(batch.tempi_rollout, configurazione)
+    tempo = tempo[:, :, None, None].expand(batch_size, rollout, numero_punti, 1)
+    lookback = batch.u0.shape[-1]
+    u0 = batch.u0[:, None, :, :].expand(batch_size, rollout, numero_punti, lookback)
+    features = torch.cat([pos, tempo, u0], dim=-1).reshape(-1, 3 + lookback)
+    if require_grad:
+        features = features.detach().clone().requires_grad_(True)
+    return features
 
 
-def operatore_differenziale_avvezione(
-    u: torch.Tensor,
-    collocation_points: torch.Tensor,
+def forward_rollout(
+    modello: torch.nn.Module,
+    batch: BatchRollout,
+    configurazione: ConfigurazioneEsperimento,
+    require_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    features = costruisci_feature_rollout(batch, configurazione, require_grad=require_grad)
+    pred_flat = modello(features)
+    pred = pred_flat.reshape(batch.target.shape)
+    return pred, features
+
+
+def loss_fisica_avvezione(
+    pred_flat: torch.Tensor,
+    features: torch.Tensor,
     configurazione: ConfigurazioneEsperimento,
 ) -> torch.Tensor:
     gradiente = torch.autograd.grad(
-        u,
-        collocation_points,
-        grad_outputs=torch.ones_like(u),
+        pred_flat,
+        features,
+        grad_outputs=torch.ones_like(pred_flat),
         create_graph=True,
         retain_graph=True,
     )[0]
 
     du_dx = gradiente[:, 0:1]
     du_dy = gradiente[:, 1:2]
-    du_dt = gradiente[:, 2:3]
-
-    return (
-        du_dt
-        + configurazione.velocita_x * du_dx
-        + configurazione.velocita_y * du_dy
-    )
+    du_dt_feature = gradiente[:, 2:3]
+    du_dt = du_dt_feature / (configurazione.t_finale - configurazione.t0)
+    residuo = du_dt + configurazione.velocita_x * du_dx + configurazione.velocita_y * du_dy
+    return torch.mean(residuo ** 2)
 
 
-def fisica_avvezione(
-    termine_differenziale: torch.Tensor,
-    u: torch.Tensor,
-    collocation_points: torch.Tensor,
+def _normalizza_stati_dmd(stati: torch.Tensor, dmd: DMDTensors) -> torch.Tensor:
+    if dmd.norm_min is None or dmd.norm_max is None:
+        return stati
+
+    norm_min = dmd.norm_min
+    norm_max = dmd.norm_max
+    if norm_min.ndim == 0:
+        return 2.0 * (stati - norm_min) / torch.clamp(norm_max - norm_min, min=1e-8) - 1.0
+
+    view_shape = (norm_min.shape[0],) + (1,) * (stati.ndim - 1)
+    norm_min = norm_min.reshape(view_shape)
+    norm_max = norm_max.reshape(view_shape)
+    return 2.0 * (stati - norm_min) / torch.clamp(norm_max - norm_min, min=1e-8) - 1.0
+
+
+def loss_dmd_rollout(
+    pred_rollout: torch.Tensor,
+    batch: BatchRollout,
+    dmd: DMDTensors,
+    punti_per_snapshot: int | None = None,
 ) -> torch.Tensor:
-    return termine_differenziale
+    numero_punti = batch.u0.shape[-2]
+    if dmd.matrix.shape[-2:] != (numero_punti, numero_punti):
+        raise ValueError(
+            f"Operatore DMD con shape {tuple(dmd.matrix.shape)} incompatibile "
+            f"con {numero_punti} punti."
+        )
 
+    if dmd.pts is not None:
+        if dmd.pts.ndim == 2:
+            scarto_punti = torch.max(torch.abs(batch.pos - dmd.pts[None, :, :]))
+        elif dmd.pts.ndim == 3:
+            scarto_punti = torch.max(torch.abs(batch.pos - dmd.pts))
+        else:
+            raise ValueError("dmd.pts deve avere shape (K,2) oppure (B,K,2).")
+        if float(scarto_punti.detach().cpu()) > 1e-4:
+            raise ValueError(
+                "I punti cloud del batch non coincidono con quelli dell'operatore DMD. "
+                "Usa gli operatori per-simulazione generati da Copia 05 nello stesso ordine."
+            )
 
-def loss_dmd_midpoint(
-    modello: torch.nn.Module,
-    dmd_operator: torch.Tensor,
-    batch_dmd: dict[str, torch.Tensor | int],
-    configurazione: ConfigurazioneEsperimento,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from pinn import loss_toeplitz
+    stati_correnti = torch.cat([batch.u0[:, None, :, -1], pred_rollout[:, :-1, :]], dim=1)
+    stati_successivi = pred_rollout
+    stati_correnti = _normalizza_stati_dmd(stati_correnti, dmd)
+    stati_successivi = _normalizza_stati_dmd(stati_successivi, dmd)
 
-    numero_intervalli = int(batch_dmd["numero_intervalli"])
-    numero_punti = int(batch_dmd["numero_punti"])
+    if dmd.matrix.ndim == 2:
+        successivi_dmd = stati_correnti @ dmd.matrix.T
+    elif dmd.matrix.ndim == 3:
+        successivi_dmd = torch.einsum("brn,bmn->brm", stati_correnti, dmd.matrix)
+    else:
+        raise ValueError("dmd.matrix deve avere shape (K,K) oppure (B,K,K).")
 
-    u_iniziali = modello(batch_dmd["x_iniziali"]).reshape(numero_intervalli, numero_punti)
-    u_finali = modello(batch_dmd["x_finali"]).reshape(numero_intervalli, numero_punti)
-    u_mezzi = modello(batch_dmd["x_mezzi"]).reshape(numero_intervalli, numero_punti)
+    if punti_per_snapshot is not None and punti_per_snapshot < numero_punti:
+        if punti_per_snapshot < 1:
+            raise ValueError("punti_per_snapshot deve essere positivo oppure None.")
+        indici_punti = torch.randperm(
+            numero_punti,
+            device=successivi_dmd.device,
+        )[:punti_per_snapshot]
+        successivi_dmd = successivi_dmd.index_select(dim=-1, index=indici_punti)
+        stati_successivi = stati_successivi.index_select(dim=-1, index=indici_punti)
 
-    derivata_temporale = (u_finali - u_iniziali) / configurazione.dt
-    derivata_dmd = u_mezzi @ dmd_operator.T
-    loss_dinamica = torch.mean((derivata_dmd - derivata_temporale) ** 2)
-    loss_toeplitz_a = loss_toeplitz(dmd_operator)
-    return loss_dinamica + loss_toeplitz_a, loss_dinamica, loss_toeplitz_a
+    return torch.mean((successivi_dmd - stati_successivi) ** 2)
 
 
 def crea_esperimento(
     configurazione: ConfigurazioneEsperimento | None = None,
-    create_model: bool = True,
-) -> dict[str, object]:
+    dmd_operator: Any = None,
+) -> dict[str, Any]:
     if configurazione is None:
         configurazione = ConfigurazioneEsperimento()
 
     np.random.seed(configurazione.seed)
     torch.manual_seed(configurazione.seed)
 
-    device = torch.device(configurazione.device)
-    dataset = DatasetDynabenchAvvezione(configurazione)
-    punti_dmd_np = crea_griglia_spaziale_dmd(dataset.numero_punti_spaziali)
-    punti_dmd = torch.as_tensor(punti_dmd_np, device=device, dtype=torch.float32)
+    device = risolvi_device(configurazione.device)
+    rng = np.random.default_rng(configurazione.seed)
 
-    modello = None
-    dmd_operator = None
-    optimizer = None
-    if create_model:
-        from pinn import PINN
+    train_dataset = DynabenchRolloutDataset(configurazione, split="train")
+    val_dataset = DynabenchRolloutDataset(configurazione, split="val")
 
-        modello = PINN(
-            input_dim=3,
-            output_dim=dataset.numero_variabili,
-            hidden_dim=configurazione.hidden_dim,
-            num_layers=configurazione.num_layers,
-        ).to(device)
-        modello = aggiungi_dropout_al_modello(
-            modello,
-            probabilita=configurazione.dropout,
-        )
-        dmd_operator = torch.nn.Parameter(
-            torch.zeros(
-                dataset.numero_punti_spaziali,
-                dataset.numero_punti_spaziali,
-                device=device,
+    source = dmd_operator if dmd_operator is not None else configurazione.dmd_operator_path
+    dmd_provider = DMDOperatorProvider(source, cache_size=configurazione.dmd_cache_size)
+    if configurazione.lambda_dmd != 0.0 and not dmd_provider.has_operator:
+        if dmd_provider.missing_path is not None:
+            raise ValueError(
+                "La loss DMD ha peso diverso da zero, ma non trovo gli operatori "
+                f"piDMD in {dmd_provider.missing_path}. Generali dal notebook "
+                "Copia 05 oppure con: python koopman_pidmd.py --split train"
             )
+        raise ValueError(
+            "La loss DMD ha peso diverso da zero, quindi devi fornire una matrice "
+            "con dmd_operator=... oppure --dmd-operator PERCORSO."
         )
-        optimizer = torch.optim.AdamW(
-            list(modello.parameters()) + [dmd_operator],
-            lr=configurazione.learning_rate,
-            weight_decay=configurazione.weight_decay,
-        )
+    if configurazione.lambda_dmd != 0.0 and configurazione.batch_size_dmd < 1:
+        raise ValueError("batch_size_dmd deve essere almeno 1 quando lambda_dmd != 0.")
+    if (
+        configurazione.lambda_dmd != 0.0
+        and configurazione.dmd_punti_per_snapshot is not None
+        and configurazione.dmd_punti_per_snapshot < 1
+    ):
+        raise ValueError("dmd_punti_per_snapshot deve essere positivo oppure None.")
+    if configurazione.lambda_dmd != 0.0 and dmd_provider.directory is not None:
+        numero_sim_train = int(sum(train_dataset.iterator.number_of_simulations))
+        numero_operatori = dmd_provider.operator_count()
+        if numero_operatori < numero_sim_train:
+            raise ValueError(
+                "Gli operatori piDMD sono incompleti: "
+                f"trovati {numero_operatori}, richiesti {numero_sim_train}. "
+                "Genera l'intero split train con: "
+                "python koopman_pidmd.py --split train --out-dir results/per_sim_final"
+            )
 
-    def operatore(u: torch.Tensor, punti: torch.Tensor) -> torch.Tensor:
-        return operatore_differenziale_avvezione(u, punti, configurazione)
+    modello = PINN(
+        input_dim=3 + configurazione.lookback,
+        output_dim=1,
+        hidden_dim=configurazione.hidden_dim,
+        num_layers=configurazione.num_layers,
+        dropout=configurazione.dropout,
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        modello.parameters(),
+        lr=configurazione.learning_rate,
+        weight_decay=configurazione.weight_decay,
+    )
 
     return {
         "configurazione": configurazione,
-        "dataset": dataset,
+        "device": device,
+        "rng": rng,
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
         "modello": modello,
-        "dmd_operator": dmd_operator,
         "optimizer": optimizer,
-        "rng": np.random.default_rng(configurazione.seed),
-        "operatore_differenziale": operatore,
-        "fisica": fisica_avvezione,
-        "punti_spaziali_dmd": punti_dmd,
-        "tempi_data": dataset.tempi_data,
-        "tempi_dmd": dataset.tempi_dmd,
+        "dmd_provider": dmd_provider,
     }
 
 
-def step_training(esperimento: dict[str, object]) -> dict[str, float]:
-    configurazione = esperimento["configurazione"]
-    dataset = esperimento["dataset"]
-    modello = esperimento["modello"]
-    dmd_operator = esperimento["dmd_operator"]
-    optimizer = esperimento["optimizer"]
-    rng = esperimento["rng"]
-    device = torch.device(configurazione.device)
-
-    if modello is None or dmd_operator is None or optimizer is None:
-        raise ValueError("create_model=True e' necessario per il training.")
+def step_training(esperimento: dict[str, Any]) -> dict[str, float]:
+    configurazione: ConfigurazioneEsperimento = esperimento["configurazione"]
+    device: torch.device = esperimento["device"]
+    rng: np.random.Generator = esperimento["rng"]
+    train_dataset: DynabenchRolloutDataset = esperimento["train_dataset"]
+    modello: torch.nn.Module = esperimento["modello"]
+    optimizer: torch.optim.Optimizer = esperimento["optimizer"]
+    dmd_provider: DMDOperatorProvider = esperimento["dmd_provider"]
 
     modello.train()
-    optimizer.zero_grad()
+    batch = train_dataset.sample_batch(rng, configurazione.batch_size, device)
 
-    x_data, y_data = dataset.campiona_snapshot(
-        rng=rng,
-        numero_traiettorie=configurazione.batch_traiettorie_data,
-        numero_tempi=configurazione.batch_tempi_data,
-        device=device,
+    optimizer.zero_grad(set_to_none=True)
+    fisica_attiva = configurazione.lambda_fisica != 0.0
+    pred_rollout, features = forward_rollout(
+        modello,
+        batch,
+        configurazione,
+        require_grad=fisica_attiva,
     )
-    loss_data = modello.data_loss(x_data, y_data)
+    loss_data = torch.mean((pred_rollout - batch.target) ** 2)
 
-    loss_fisica = loss_data.new_zeros(())
-    if configurazione.lambda_fisica != 0.0:
-        x_fisica, _ = dataset.campiona_snapshot(
-            rng=rng,
-            numero_traiettorie=configurazione.batch_traiettorie_fisica,
-            numero_tempi=configurazione.batch_tempi_fisica,
-            device=device,
-        )
-        loss_fisica = modello.physics_loss(
-            x_fisica,
-            esperimento["operatore_differenziale"],
-            esperimento["fisica"],
-        )
-
-    loss_dmd = loss_data.new_zeros(())
-    loss_dmd_dinamica = loss_data.new_zeros(())
-    loss_toeplitz_a = loss_data.new_zeros(())
-    if configurazione.lambda_dmd != 0.0:
-        batch_dmd = campiona_batch_dmd(
-            dataset=dataset,
-            punti_spaziali_dmd=esperimento["punti_spaziali_dmd"],
-            rng=rng,
-            configurazione=configurazione,
-        )
-        loss_dmd, loss_dmd_dinamica, loss_toeplitz_a = loss_dmd_midpoint(
-            modello,
-            dmd_operator,
-            batch_dmd,
+    if fisica_attiva:
+        loss_fisica = loss_fisica_avvezione(
+            pred_rollout.reshape(-1, 1),
+            features,
             configurazione,
         )
+    else:
+        loss_fisica = loss_data.new_zeros(())
+
+    if configurazione.lambda_dmd != 0.0:
+        batch_dmd = train_dataset.sample_batch(rng, configurazione.batch_size_dmd, device)
+        pred_dmd, _ = forward_rollout(
+            modello,
+            batch_dmd,
+            configurazione,
+            require_grad=False,
+        )
+        dmd = dmd_provider.get_for_batch(batch_dmd, device=device, dtype=batch_dmd.target.dtype)
+        loss_dmd = loss_dmd_rollout(
+            pred_dmd,
+            batch_dmd,
+            dmd,
+            punti_per_snapshot=configurazione.dmd_punti_per_snapshot,
+        )
+    else:
+        loss_dmd = loss_data.new_zeros(())
 
     loss_totale = (
         configurazione.lambda_data * loss_data
@@ -454,6 +660,8 @@ def step_training(esperimento: dict[str, object]) -> dict[str, float]:
         + configurazione.lambda_dmd * loss_dmd
     )
     loss_totale.backward()
+    if configurazione.clip_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(modello.parameters(), configurazione.clip_grad_norm)
     optimizer.step()
 
     return {
@@ -461,68 +669,62 @@ def step_training(esperimento: dict[str, object]) -> dict[str, float]:
         "loss_data": float(loss_data.detach().cpu()),
         "loss_fisica": float(loss_fisica.detach().cpu()),
         "loss_dmd": float(loss_dmd.detach().cpu()),
-        "loss_dmd_dinamica": float(loss_dmd_dinamica.detach().cpu()),
-        "loss_toeplitz": float(loss_toeplitz_a.detach().cpu()),
     }
 
 
 @torch.no_grad()
-def calcola_norma_l2(
-    esperimento: dict[str, object],
-    numero_punti: int | None = None,
-) -> dict[str, float]:
-    configurazione = esperimento["configurazione"]
-    dataset = esperimento["dataset"]
-    modello = esperimento["modello"]
-    rng = esperimento["rng"]
-    device = torch.device(configurazione.device)
+def valida(esperimento: dict[str, Any], numero_batch: int | None = None) -> dict[str, float]:
+    configurazione: ConfigurazioneEsperimento = esperimento["configurazione"]
+    device: torch.device = esperimento["device"]
+    rng: np.random.Generator = esperimento["rng"]
+    val_dataset: DynabenchRolloutDataset = esperimento["val_dataset"]
+    modello: torch.nn.Module = esperimento["modello"]
 
-    if modello is None:
-        raise ValueError("create_model=True e' necessario per calcolare l'errore.")
-
+    numero_batch = configurazione.validation_batches if numero_batch is None else numero_batch
     modello.eval()
-    numero_punti = configurazione.numero_punti_l2 if numero_punti is None else numero_punti
-    x_l2, y_l2 = dataset.campiona_punti_l2(
-        rng=rng,
-        numero_punti=numero_punti,
+    somma_quadrati_per_tempo = torch.zeros(
+        configurazione.rollout,
         device=device,
+        dtype=torch.float64,
     )
-    y_pred = modello(x_l2)
-    errore_medio_quadratico = torch.mean((y_pred - y_l2) ** 2)
-    energia_media = torch.mean(y_l2 ** 2)
-    misura_spazio_tempo = configurazione.t_finale - configurazione.t0
-    norma_l2 = torch.sqrt(misura_spazio_tempo * errore_medio_quadratico)
-    norma_l2_relativa = torch.sqrt(
-        errore_medio_quadratico / torch.clamp(energia_media, min=1e-12)
-    )
+    elementi_per_tempo = 0
+    for _ in range(numero_batch):
+        batch = val_dataset.sample_batch(rng, configurazione.batch_validation, device)
+        pred_rollout, _ = forward_rollout(modello, batch, configurazione, require_grad=False)
+        differenza = pred_rollout - batch.target
+        somma_quadrati_per_tempo += torch.sum((differenza.double() ** 2), dim=(0, 2))
+        elementi_per_tempo += differenza.shape[0] * differenza.shape[2]
 
-    return {
-        "norma_l2": float(norma_l2.cpu()),
-        "norma_l2_relativa": float(norma_l2_relativa.cpu()),
-        "punti_quadratura": int(max(1001, numero_punti)),
+    mse_per_tempo = somma_quadrati_per_tempo / max(elementi_per_tempo, 1)
+    metriche = {
+        "validation_mse_mean": float(torch.mean(mse_per_tempo).detach().cpu()),
+        "validation_mse_rollout16": float(torch.mean(mse_per_tempo).detach().cpu()),
     }
+    for indice, valore in enumerate(mse_per_tempo.detach().cpu().tolist(), start=1):
+        metriche[f"validation_mse_step_{indice:02d}"] = float(valore)
+    return metriche
 
 
 def allena(
-    esperimento: dict[str, object],
+    esperimento: dict[str, Any],
     numero_valutazioni: int | None = None,
     stampa_ogni: int = 100,
-    valuta_l2_ogni: int = 500,
+    valida_ogni: int = 500,
 ) -> list[dict[str, float]]:
-    configurazione = esperimento["configurazione"]
+    configurazione: ConfigurazioneEsperimento = esperimento["configurazione"]
     if numero_valutazioni is None:
         numero_valutazioni = configurazione.numero_valutazioni_training
 
-    storico = []
+    storico: list[dict[str, float]] = []
     for valutazione in range(1, numero_valutazioni + 1):
         metriche = step_training(esperimento)
         metriche["valutazione"] = float(valutazione)
 
-        if valutazione == 1 or valutazione % valuta_l2_ogni == 0:
-            metriche.update(calcola_norma_l2(esperimento))
+        if valutazione == 1 or (valida_ogni > 0 and valutazione % valida_ogni == 0):
+            metriche.update(valida(esperimento))
+            stampa_validation_terminal(metriche, valutazione, numero_valutazioni)
 
         storico.append(metriche)
-
         if stampa_ogni > 0 and (valutazione == 1 or valutazione % stampa_ogni == 0):
             messaggio = (
                 f"[{valutazione:05d}/{numero_valutazioni}] "
@@ -531,48 +733,262 @@ def allena(
                 f"fisica={metriche['loss_fisica']:.6e} "
                 f"dmd={metriche['loss_dmd']:.6e}"
             )
-            if "norma_l2" in metriche:
-                messaggio += (
-                    f" l2={metriche['norma_l2']:.6e} "
-                    f"l2_rel={metriche['norma_l2_relativa']:.6e}"
-                )
+            if "validation_mse_rollout16" in metriche:
+                messaggio += f" val_mse16={metriche['validation_mse_rollout16']:.6e}"
             print(messaggio)
 
     return storico
 
 
-def descrivi_esperimento(esperimento: dict[str, object]) -> None:
-    configurazione = esperimento["configurazione"]
-    dataset = esperimento["dataset"]
-    print("Esperimento PINN su Dynabench advection")
+def stampa_validation_terminal(
+    metriche: dict[str, float],
+    valutazione: int,
+    numero_valutazioni: int,
+) -> None:
+    step_keys = sorted(k for k in metriche if k.startswith("validation_mse_step_"))
+    if not step_keys:
+        return
+
+    valori = [metriche[k] for k in step_keys]
+    print(
+        f"\nValidation [{valutazione:05d}/{numero_valutazioni}] "
+        f"mean={metriche['validation_mse_mean']:.6e} "
+        f"t+1={valori[0]:.6e} "
+        f"t+{len(valori)}={valori[-1]:.6e} "
+        f"min={min(valori):.6e} "
+        f"max={max(valori):.6e}"
+    )
+    print("  MSE per rollout step:")
+    for start in range(0, len(valori), 4):
+        pezzi = []
+        for offset, valore in enumerate(valori[start:start + 4], start=start + 1):
+            pezzi.append(f"t+{offset:02d}={valore:.3e}")
+        print("    " + "  ".join(pezzi))
+    print()
+
+
+def salva_storico_csv(storico: list[dict[str, float]], path: str | Path) -> None:
+    if not storico:
+        return
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    campi: list[str] = []
+    for riga in storico:
+        for chiave in riga:
+            if chiave not in campi:
+                campi.append(chiave)
+
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=campi)
+        writer.writeheader()
+        writer.writerows(storico)
+
+
+def plotta_errori_validation(
+    storico: list[dict[str, float]],
+    path: str | Path = "results/validation_errors.png",
+) -> None:
+    righe_validation = [riga for riga in storico if "validation_mse_mean" in riga]
+    if not righe_validation:
+        print("Nessuna metrica di validation trovata: grafico non generato.")
+        return
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    steps = np.asarray([riga["valutazione"] for riga in righe_validation], dtype=np.float64)
+    mse_mean = np.asarray([riga["validation_mse_mean"] for riga in righe_validation], dtype=np.float64)
+    rollout_keys = [
+        f"validation_mse_step_{indice:02d}"
+        for indice in range(1, 1 + len([k for k in righe_validation[0] if k.startswith("validation_mse_step_")]))
+    ]
+
+    mse_matrix = np.asarray(
+        [[riga[key] for riga in righe_validation] for key in rollout_keys],
+        dtype=np.float64,
+    )
+    mse_log = np.log10(np.maximum(mse_matrix, 1e-12))
+    rollout_steps = np.arange(1, len(rollout_keys) + 1)
+
+    fig = plt.figure(figsize=(11, 10), constrained_layout=True)
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.0, 1.8, 1.0])
+    ax_mean = fig.add_subplot(gs[0])
+    ax_heatmap = fig.add_subplot(gs[1])
+    ax_profile = fig.add_subplot(gs[2])
+
+    ax_mean.plot(steps, mse_mean, marker="o", linewidth=2.0, color="black", label="media t+1..t+16")
+    ax_mean.plot(
+        steps,
+        mse_matrix[0],
+        marker=".",
+        linewidth=1.2,
+        color="#3b82f6",
+        label="t+1",
+    )
+    ax_mean.plot(
+        steps,
+        mse_matrix[-1],
+        marker=".",
+        linewidth=1.2,
+        color="#ef4444",
+        label=f"t+{len(rollout_keys)}",
+    )
+    ax_mean.set_ylabel("Validation MSE")
+    ax_mean.set_title("Validation: media rollout, primo e ultimo passo")
+    if np.all(mse_mean > 0):
+        ax_mean.set_yscale("log")
+    ax_mean.grid(alpha=0.3)
+    ax_mean.legend(loc="best")
+
+    if len(steps) == 1:
+        extent = [steps[0] - 0.5, steps[0] + 0.5, 0.5, len(rollout_keys) + 0.5]
+    else:
+        delta = float(np.median(np.diff(steps)))
+        extent = [steps[0] - 0.5 * delta, steps[-1] + 0.5 * delta, 0.5, len(rollout_keys) + 0.5]
+    image = ax_heatmap.imshow(
+        mse_log,
+        aspect="auto",
+        origin="lower",
+        extent=extent,
+        cmap="viridis",
+    )
+    ax_heatmap.set_ylabel("Rollout step")
+    ax_heatmap.set_title("Heatmap validation: log10(MSE) per orizzonte")
+    ax_heatmap.set_yticks(rollout_steps)
+    colorbar = fig.colorbar(image, ax=ax_heatmap)
+    colorbar.set_label("log10(MSE)")
+
+    ultimo_profilo = mse_matrix[:, -1]
+    ax_profile.plot(rollout_steps, ultimo_profilo, marker="o", linewidth=2.0, color="#0f766e")
+    ax_profile.set_xlabel("Rollout step futuro")
+    ax_profile.set_ylabel("Validation MSE")
+    ax_profile.set_title(f"Profilo ultimo checkpoint: step training {int(steps[-1])}")
+    if np.all(ultimo_profilo > 0):
+        ax_profile.set_yscale("log")
+    ax_profile.set_xticks(rollout_steps)
+    ax_profile.grid(alpha=0.3)
+
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"Grafico validation salvato in {path}")
+
+
+def descrivi_esperimento(esperimento: dict[str, Any]) -> None:
+    configurazione: ConfigurazioneEsperimento = esperimento["configurazione"]
+    train_dataset: DynabenchRolloutDataset = esperimento["train_dataset"]
+    val_dataset: DynabenchRolloutDataset = esperimento["val_dataset"]
+    device: torch.device = esperimento["device"]
+
+    print("Esperimento PINN/DMD su Dynabench advection")
+    print(f"Device: {device}")
     print("Dominio spaziale: [0, 1] x [0, 1]")
-    print(f"Intervallo temporale: [{configurazione.t0}, {configurazione.t_finale}]")
-    print(f"File split {configurazione.split}: {len(dataset.paths)}")
-    print(f"Traiettorie totali: {dataset.numero_traiettorie}")
-    print(f"Snapshot per traiettoria: {dataset.numero_tempi}")
-    print(f"Rollback/intervalli consecutivi disponibili: {dataset.numero_rollback}")
-    print(f"Punti spaziali per snapshot: {dataset.numero_punti_spaziali}")
-    print(f"Tempi data: {dataset.tempi_data[0]} ... {dataset.tempi_data[-1]}")
-    print(f"Tempi DMD: {dataset.tempi_dmd[0]} ... {dataset.tempi_dmd[-1]}")
+    print(f"Dominio temporale: [{configurazione.t0}, {configurazione.t_finale}]")
+    print(f"Iterator train: lookback={configurazione.lookback}, rollout={configurazione.rollout}")
+    print(f"Finestre train: {len(train_dataset)}")
+    print(f"Finestre val: {len(val_dataset)}")
+    print(f"Punti cloud per snapshot: {train_dataset.numero_punti}")
+    punti_dmd = (
+        train_dataset.numero_punti
+        if configurazione.dmd_punti_per_snapshot is None
+        else min(configurazione.dmd_punti_per_snapshot, train_dataset.numero_punti)
+    )
+    print(
+        "Collocation DMD per step: "
+        f"{configurazione.batch_size_dmd} finestre x "
+        f"{configurazione.rollout} tempi x "
+        f"{punti_dmd} punti"
+    )
+    print(f"Griglia dynabench.grid: {train_dataset.griglia_dominio}")
     print(
         "Pesi loss: "
         f"data={configurazione.lambda_data}, "
         f"fisica={configurazione.lambda_fisica}, "
         f"dmd={configurazione.lambda_dmd}"
     )
-    print(
-        "Regolarizzazione: "
-        f"dropout={configurazione.dropout}, "
-        f"weight_decay={configurazione.weight_decay}"
-    )
     print(f"Valutazioni training: {configurazione.numero_valutazioni_training}")
-    print(f"Punti quadratura L2: {max(1001, configurazione.numero_punti_l2)}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Training PINN su Dynabench advection (lookback=1, rollout=16).")
+    parser.add_argument("--dmd-operator", help="File .npy/.npz/.pt/.csv o directory di operatori per-simulazione.")
+    parser.add_argument("--evals", type=int, help="Numero di valutazioni/step di training.")
+    parser.add_argument("--batch-size", type=int, help="Batch size train in finestre Dynabench.")
+    parser.add_argument("--batch-size-dmd", type=int, help="Finestre Dynabench usate solo per la DMD loss.")
+    parser.add_argument("--dmd-punti-per-snapshot", type=int, help="Punti spaziali usati nella DMD loss; 225 usa tutto.")
+    parser.add_argument("--validation-batches", type=int, help="Numero batch usati per la validation.")
+    parser.add_argument("--batch-validation", type=int, help="Batch size validation in finestre Dynabench.")
+    parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0 oppure auto.")
+    parser.add_argument("--print-every", type=int, default=100)
+    parser.add_argument("--validate-every", type=int, default=500)
+    parser.add_argument("--save-model", help="Percorso .pt in cui salvare pesi e configurazione.")
+    parser.add_argument("--history-csv", default="results/training_history.csv", help="CSV dello storico training/validation.")
+    parser.add_argument("--validation-plot", default="results/validation_errors.png", help="PNG con errori validation.")
+    parser.add_argument("--download", action="store_true", help="Scarica il dataset se non presente.")
+    parser.add_argument("--lambda-data", type=float, help="Peso della data loss.")
+    parser.add_argument("--lambda-fisica", type=float, help="Peso della physics loss.")
+    parser.add_argument("--lambda-dmd", type=float, help="Peso della DMD loss.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    configurazione = ConfigurazioneEsperimento(download=args.download)
+    if args.dmd_operator is not None:
+        configurazione = replace(configurazione, dmd_operator_path=args.dmd_operator)
+    if args.evals is not None:
+        configurazione = replace(configurazione, numero_valutazioni_training=args.evals)
+    if args.batch_size is not None:
+        configurazione = replace(configurazione, batch_size=args.batch_size)
+    if args.batch_size_dmd is not None:
+        configurazione = replace(configurazione, batch_size_dmd=args.batch_size_dmd)
+    if args.dmd_punti_per_snapshot is not None:
+        configurazione = replace(configurazione, dmd_punti_per_snapshot=args.dmd_punti_per_snapshot)
+    if args.validation_batches is not None:
+        configurazione = replace(configurazione, validation_batches=args.validation_batches)
+    if args.batch_validation is not None:
+        configurazione = replace(configurazione, batch_validation=args.batch_validation)
+    if args.device is not None:
+        configurazione = replace(configurazione, device=args.device)
+    if args.lambda_data is not None:
+        configurazione = replace(configurazione, lambda_data=args.lambda_data)
+    if args.lambda_fisica is not None:
+        configurazione = replace(configurazione, lambda_fisica=args.lambda_fisica)
+    if args.lambda_dmd is not None:
+        configurazione = replace(configurazione, lambda_dmd=args.lambda_dmd)
+
+    esperimento = crea_esperimento(configurazione)
+    descrivi_esperimento(esperimento)
+    storico = allena(
+        esperimento,
+        numero_valutazioni=configurazione.numero_valutazioni_training,
+        stampa_ogni=args.print_every,
+        valida_ogni=args.validate_every,
+    )
+    if args.history_csv:
+        salva_storico_csv(storico, args.history_csv)
+        print(f"Storico salvato in {args.history_csv}")
+    if args.validation_plot:
+        plotta_errori_validation(storico, args.validation_plot)
+
+    if args.save_model:
+        path = Path(args.save_model)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model_state_dict": esperimento["modello"].state_dict(),
+                "configurazione": configurazione.__dict__,
+                "storico": storico,
+            },
+            path,
+        )
+        print(f"Modello salvato in {path}")
 
 
 if __name__ == "__main__":
-    esperimento = crea_esperimento()
-    try:
-        descrivi_esperimento(esperimento)
-        allena(esperimento)
-    finally:
-        esperimento["dataset"].close()
+    main()

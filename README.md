@@ -65,3 +65,33 @@ Requisiti aggiuntivi:
 
 - `matplotlib`
 - `h5py` (solo se si vogliono aprire file .h5)
+
+## Operatori Koopman-piDMD per la loss DMD
+
+La loss DMD usa gli operatori generati dal notebook
+`Copia_di_05_koopman_pidmd_pipeline_FINAL.ipynb`. Per rigenerarli da script:
+
+```bash
+python koopman_pidmd.py --split train --out-dir results/per_sim_final
+```
+
+Lo script salva file del tipo:
+
+```text
+results/per_sim_final/koopman_pidmd_r58_sim00000.npz
+```
+
+`esperimento.py` usa questa directory come sorgente DMD di default.
+
+Esempio di training con lookback 1, fisica differenziale spenta e piu' finestre
+per il vincolo DMD:
+
+```bash
+python esperimento.py --evals 5000 --batch-size 4 --batch-size-dmd 10 --dmd-punti-per-snapshot 100 --save-model results/pinn_advection.pt
+```
+
+Se `--lambda-fisica 0`, il termine PDE viene spento e non viene calcolata la
+differenziazione automatica sui collocation point fisici.
+
+La DMD resta calcolata con l'operatore completo `225x225`, ma la loss viene
+mediata solo sui punti indicati da `--dmd-punti-per-snapshot`.

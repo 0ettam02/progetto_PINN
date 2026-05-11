@@ -6,3 +6,4 @@ scikit-learn
 matplotlib
 torch
 h5py
+pydmd
