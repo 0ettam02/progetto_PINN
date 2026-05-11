@@ -6,14 +6,12 @@ import math
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
-from dynabench.dataset import DynabenchIterator
-from dynabench.grid import Grid
 
-from pinn import PINN
+from pinn import AdvectionCNN, PINN
 
 
 @dataclass(frozen=True)
@@ -29,26 +27,89 @@ class ConfigurazioneEsperimento:
     dt: float = 1.0
     velocita_x: float = 1.0
     velocita_y: float = 1.0
+    model_architecture: str = "cnn"
     hidden_dim: int = 64
-    num_layers: int = 4
+    num_layers: int = 6
     dropout: float = 0.0
+    optimizer_name: str = "adamw_amsgrad"
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-6
+    weight_decay: float = 1e-5
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.99
+    lr_scheduler: str = "onecycle"
+    onecycle_pct_start: float = 0.15
+    onecycle_div_factor: float = 20.0
+    onecycle_final_div_factor: float = 100.0
     numero_valutazioni_training: int = 5000
-    batch_size: int = 4
+    batch_size: int = 32
     batch_size_dmd: int = 16
-    dmd_punti_per_snapshot: int | None = 100
-    batch_validation: int = 8
-    validation_batches: int = 8
+    dmd_punti_per_snapshot: int | None = None
+    batch_validation: int = 32
+    validation_batches: int | None = 20
     lambda_data: float = 1.0
     lambda_fisica: float = 0.0
-    lambda_dmd: float = 0.0
+    lambda_dmd: float = 1.0
     seed: int = 42
     device: str = "auto"
     dmd_operator_path: str | None = "results/per_sim_final"
+    dmd_svd_rank: int = 58
+    dmd_auto_generate: bool = True
     download: bool = False
     clip_grad_norm: float | None = 1.0
     dmd_cache_size: int = 10
+    cnn_interpolation_neighbors: int = 8
+    cnn_use_coordinates: bool = True
+
+
+class CampionatoreQuasiMonteCarlo:
+    """Campionatore Sobol con stream separati per train, validation e DMD."""
+
+    def __init__(self, seed: int):
+        self.seed = seed
+        self._engines: dict[tuple[str, int], torch.quasirandom.SobolEngine] = {}
+
+    def draw(self, stream: str, dimensione: int, n: int) -> np.ndarray:
+        if dimensione < 1:
+            raise ValueError("dimensione deve essere positiva.")
+        if n < 1:
+            raise ValueError("n deve essere positivo.")
+
+        key = (stream, dimensione)
+        if key not in self._engines:
+            self._engines[key] = torch.quasirandom.SobolEngine(
+                dimension=dimensione,
+                scramble=True,
+                seed=self.seed + self._stream_offset(stream, dimensione),
+            )
+        return self._engines[key].draw(n).cpu().numpy()
+
+    def indici(self, stream: str, massimo: int, n: int) -> np.ndarray:
+        if massimo < 1:
+            raise ValueError("massimo deve essere positivo.")
+        valori = self.draw(stream, 1, n)[:, 0]
+        indici = np.floor(valori * massimo).astype(np.int64)
+        return np.clip(indici, 0, massimo - 1)
+
+    def indici_unici(
+        self,
+        stream: str,
+        massimo: int,
+        n: int,
+    ) -> np.ndarray:
+        if n >= massimo:
+            return np.arange(massimo, dtype=np.int64)
+
+        indici = np.empty(0, dtype=np.int64)
+        while indici.size < n:
+            nuovi = self.indici(stream, massimo, max(2 * n, 16))
+            indici = np.unique(np.concatenate([indici, nuovi]))
+        return np.sort(indici[:n])
+
+    def _stream_offset(self, stream: str, dimensione: int) -> int:
+        offset = 9973 * dimensione
+        for indice, carattere in enumerate(stream, start=1):
+            offset += indice * ord(carattere)
+        return offset
 
 
 @dataclass
@@ -78,6 +139,91 @@ class DMDTensors:
     pts: torch.Tensor | None = None
 
 
+class KoopmanPIDMDOperatorFactory:
+    """Genera gli operatori piDMD mancanti usando la pipeline del notebook Copia 05."""
+
+    def __init__(
+        self,
+        out_dir: str | Path,
+        configurazione: ConfigurazioneEsperimento,
+        split: str = "train",
+    ) -> None:
+        self.out_dir = Path(out_dir)
+        self.configurazione = configurazione
+        self.split = split
+        self._sim_iterator = None
+        self._tools_loaded = False
+        self._iterator_cls: Any = None
+        self._extract_features: Any = None
+        self._save_features: Any = None
+
+    def __call__(self, indice_simulazione: int) -> Path:
+        output_path = self.out_dir / self._filename(indice_simulazione)
+        if output_path.exists():
+            return output_path
+
+        sim_iterator = self._get_sim_iterator()
+        if indice_simulazione < 0 or indice_simulazione >= len(sim_iterator):
+            raise IndexError(
+                "Indice simulazione fuori range per generazione piDMD: "
+                f"{indice_simulazione}"
+            )
+
+        print(
+            "Operatore piDMD mancante: "
+            f"genero sim {indice_simulazione:05d} e salvo in {output_path}"
+        )
+        features = self._extract_features(
+            indice_simulazione,
+            sim_iterator,
+            svd_rank=self.configurazione.dmd_svd_rank,
+        )
+        return self._save_features(
+            features,
+            out_dir=self.out_dir,
+            svd_rank=self.configurazione.dmd_svd_rank,
+        )
+
+    def _filename(self, indice_simulazione: int) -> str:
+        return (
+            f"koopman_pidmd_r{self.configurazione.dmd_svd_rank}_"
+            f"sim{indice_simulazione:05d}.npz"
+        )
+
+    def _get_sim_iterator(self) -> Any:
+        self._load_tools()
+        if self._sim_iterator is None:
+            self._sim_iterator = self._iterator_cls(
+                split=self.split,
+                equation=self.configurazione.equation,
+                structure=self.configurazione.structure,
+                resolution=self.configurazione.resolution,
+                base_path=self.configurazione.data_root,
+                download=self.configurazione.download,
+            )
+        return self._sim_iterator
+
+    def _load_tools(self) -> None:
+        if self._tools_loaded:
+            return
+        try:
+            from koopman_pidmd import (
+                DynabenchSimulationIterator,
+                extract_koopman_features,
+                save_koopman_features,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "Non posso generare gli operatori piDMD: installa le dipendenze "
+                "con `python -m pip install -r requirements.txt`."
+            ) from exc
+
+        self._iterator_cls = DynabenchSimulationIterator
+        self._extract_features = extract_koopman_features
+        self._save_features = save_koopman_features
+        self._tools_loaded = True
+
+
 def risolvi_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,6 +241,15 @@ class DynabenchRolloutDataset:
     """Wrapper leggero attorno a DynabenchIterator per finestre (1, 16)."""
 
     def __init__(self, configurazione: ConfigurazioneEsperimento, split: str):
+        try:
+            from dynabench.dataset import DynabenchIterator
+            from dynabench.grid import Grid
+        except ImportError as exc:
+            raise RuntimeError(
+                "dynabench non e' installato. Installa le dipendenze con "
+                "`python -m pip install -r requirements.txt`."
+            ) from exc
+
         self.configurazione = configurazione
         self.split = split
         self.iterator = DynabenchIterator(
@@ -130,16 +285,30 @@ class DynabenchRolloutDataset:
         lato = int(round(math.sqrt(self.numero_punti)))
         if lato * lato != self.numero_punti:
             raise ValueError("Per low/cloud ci si aspetta un numero quadrato di punti.")
+        self.grid_shape = (lato, lato)
+        self.grid_points = self._costruisci_griglia_regolare(lato)
 
         self.griglia_dominio = Grid(
             grid_size=(lato, lato),
             grid_limits=((0.0, 1.0), (0.0, 1.0)),
         )
-        self.offset_simulazioni = np.cumsum(self.iterator.number_of_simulations) - self.iterator.number_of_simulations[0]
+        self.simulation_starts = np.concatenate(
+            [
+                np.array([0], dtype=np.int64),
+                np.cumsum(self.iterator.number_of_simulations, dtype=np.int64),
+            ]
+        )
+        self.offset_simulazioni = self.simulation_starts[:-1]
+        self.numero_simulazioni_totali = int(self.simulation_starts[-1])
         self._controlla_punti_nel_dominio(sample.pos)
 
     def __len__(self) -> int:
         return len(self.iterator)
+
+    def _costruisci_griglia_regolare(self, lato: int) -> np.ndarray:
+        coordinate = np.linspace(0.0, 1.0, lato, dtype=np.float32)
+        xx, yy = np.meshgrid(coordinate, coordinate, indexing="xy")
+        return np.column_stack([xx.reshape(-1), yy.reshape(-1)]).astype(np.float32)
 
     def _controlla_punti_nel_dominio(self, pos: np.ndarray) -> None:
         x_lim, y_lim = self.griglia_dominio.grid_limits
@@ -171,15 +340,68 @@ class DynabenchRolloutDataset:
         indice_sim_globale = int(self.offset_simulazioni[indice_file] + indice_sim_locale)
         return indice_file, int(indice_sim_locale), int(indice_temporale), indice_sim_globale
 
+    def codifica_indice(self, indice_sim_globale: int, indice_temporale: int) -> int:
+        if indice_sim_globale < 0 or indice_sim_globale >= self.numero_simulazioni_totali:
+            raise IndexError("Indice simulazione fuori range.")
+
+        indice_file = int(np.searchsorted(self.simulation_starts[1:], indice_sim_globale, side="right"))
+        indice_sim_locale = int(indice_sim_globale - self.simulation_starts[indice_file])
+        usable_len = int(self.iterator.usable_simulation_lengths[indice_file])
+        indice_temporale = min(max(int(indice_temporale), 0), usable_len - 1)
+        return int(
+            self.iterator.starting_indices[indice_file]
+            + indice_sim_locale * usable_len
+            + indice_temporale
+        )
+
+    def sample_indici_quasi_montecarlo(
+        self,
+        qmc: CampionatoreQuasiMonteCarlo,
+        stream: str,
+        batch_size: int,
+    ) -> np.ndarray:
+        punti = qmc.draw(stream, 2, batch_size)
+        indici_simulazione = np.floor(
+            punti[:, 0] * self.numero_simulazioni_totali
+        ).astype(np.int64)
+        indici_simulazione = np.clip(
+            indici_simulazione,
+            0,
+            self.numero_simulazioni_totali - 1,
+        )
+
+        indici = []
+        for valore_tempo, indice_sim_globale in zip(punti[:, 1], indici_simulazione):
+            indice_file = int(np.searchsorted(self.simulation_starts[1:], indice_sim_globale, side="right"))
+            usable_len = int(self.iterator.usable_simulation_lengths[indice_file])
+            indice_temporale = int(np.floor(valore_tempo * usable_len))
+            indice_temporale = min(max(indice_temporale, 0), usable_len - 1)
+            indici.append(self.codifica_indice(int(indice_sim_globale), indice_temporale))
+
+        return np.asarray(indici, dtype=np.int64)
+
     def sample_batch(
         self,
         rng: np.random.Generator,
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        qmc: CampionatoreQuasiMonteCarlo | None = None,
+        stream: str = "train",
     ) -> BatchRollout:
-        indici = rng.integers(0, len(self), size=batch_size, endpoint=False)
+        if qmc is None:
+            indici = rng.integers(0, len(self), size=batch_size, endpoint=False)
+        else:
+            indici = self.sample_indici_quasi_montecarlo(qmc, stream, batch_size)
 
+        return self.batch_da_indici(indici, device=device, dtype=dtype)
+
+    def batch_da_indici(
+        self,
+        indici: np.ndarray,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> BatchRollout:
         u0_list: list[np.ndarray] = []
         target_list: list[np.ndarray] = []
         pos_list: list[np.ndarray] = []
@@ -221,9 +443,16 @@ class DynabenchRolloutDataset:
 
 
 class DMDOperatorProvider:
-    def __init__(self, source: Any = None, cache_size: int = 32):
+    def __init__(
+        self,
+        source: Any = None,
+        cache_size: int = 32,
+        missing_operator_factory: Callable[[int], Path] | None = None,
+        allow_missing_directory: bool = False,
+    ):
         self.source = source
         self.cache_size = cache_size
+        self._missing_operator_factory = missing_operator_factory
         self._cache: OrderedDict[int, DMDRecord] = OrderedDict()
         self._fixed_record: DMDRecord | None = None
         self._directory: Path | None = None
@@ -238,10 +467,13 @@ class DMDOperatorProvider:
 
         path = Path(source)
         if not path.exists():
+            if allow_missing_directory and path.suffix == "":
+                self._directory = path
+                return
             self._missing_path = path
             return
         if path.is_dir():
-            if not any(path.glob("*.npz")):
+            if not any(path.glob("*.npz")) and not allow_missing_directory:
                 self._missing_path = path
                 return
             self._directory = path
@@ -259,6 +491,10 @@ class DMDOperatorProvider:
     @property
     def directory(self) -> Path | None:
         return self._directory
+
+    @property
+    def can_generate_missing(self) -> bool:
+        return self._directory is not None and self._missing_operator_factory is not None
 
     def operator_count(self) -> int:
         if self._directory is None:
@@ -318,6 +554,13 @@ class DMDOperatorProvider:
             raise RuntimeError("Directory DMD non configurata.")
 
         candidates = sorted(self._directory.glob(f"*sim{indice_simulazione:05d}.npz"))
+        if not candidates and self._missing_operator_factory is not None:
+            generated_path = self._missing_operator_factory(indice_simulazione)
+            if generated_path.exists():
+                candidates = [generated_path]
+            else:
+                candidates = sorted(self._directory.glob(f"*sim{indice_simulazione:05d}.npz"))
+
         if not candidates:
             raise FileNotFoundError(
                 f"Nessun operatore DMD trovato per sim {indice_simulazione:05d} "
@@ -416,6 +659,67 @@ class DMDOperatorProvider:
         return float(np.asarray(value).reshape(-1)[0])
 
 
+def _dmd_source_supports_auto_generation(source: Any) -> bool:
+    if source is None or isinstance(source, (np.ndarray, torch.Tensor)):
+        return False
+
+    path = Path(source)
+    if path.exists():
+        return path.is_dir()
+
+    operator_file_suffixes = {".npy", ".npz", ".pt", ".pth", ".csv", ".txt"}
+    return path.suffix.lower() not in operator_file_suffixes
+
+
+def costruisci_optimizer(
+    parametri: list[torch.nn.Parameter],
+    configurazione: ConfigurazioneEsperimento,
+) -> torch.optim.Optimizer:
+    if configurazione.optimizer_name == "adamw_amsgrad":
+        return torch.optim.AdamW(
+            parametri,
+            lr=configurazione.learning_rate,
+            betas=(configurazione.adam_beta1, configurazione.adam_beta2),
+            weight_decay=configurazione.weight_decay,
+            amsgrad=True,
+        )
+    if configurazione.optimizer_name == "adamw":
+        return torch.optim.AdamW(
+            parametri,
+            lr=configurazione.learning_rate,
+            betas=(configurazione.adam_beta1, configurazione.adam_beta2),
+            weight_decay=configurazione.weight_decay,
+        )
+    raise ValueError(
+        "optimizer_name non supportato: "
+        f"{configurazione.optimizer_name!r}. Usa 'adamw_amsgrad' oppure 'adamw'."
+    )
+
+
+def costruisci_scheduler(
+    optimizer: torch.optim.Optimizer,
+    configurazione: ConfigurazioneEsperimento,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    if configurazione.lr_scheduler == "none":
+        return None
+    if configurazione.numero_valutazioni_training < 1:
+        return None
+    if configurazione.lr_scheduler == "onecycle":
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=configurazione.learning_rate,
+            total_steps=configurazione.numero_valutazioni_training,
+            pct_start=configurazione.onecycle_pct_start,
+            anneal_strategy="cos",
+            div_factor=configurazione.onecycle_div_factor,
+            final_div_factor=configurazione.onecycle_final_div_factor,
+        )
+    raise ValueError(
+        "lr_scheduler non supportato: "
+        f"{configurazione.lr_scheduler!r}. Usa 'onecycle' oppure 'none'."
+    )
+
+
 def costruisci_feature_rollout(
     batch: BatchRollout,
     configurazione: ConfigurazioneEsperimento,
@@ -438,7 +742,12 @@ def forward_rollout(
     batch: BatchRollout,
     configurazione: ConfigurazioneEsperimento,
     require_grad: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if hasattr(modello, "forward_cloud"):
+        if require_grad:
+            raise ValueError("La loss fisica pointwise non e' supportata dal modello CNN.")
+        return modello.forward_cloud(batch.u0, batch.pos), None
+
     features = costruisci_feature_rollout(batch, configurazione, require_grad=require_grad)
     pred_flat = modello(features)
     pred = pred_flat.reshape(batch.target.shape)
@@ -486,6 +795,7 @@ def loss_dmd_rollout(
     batch: BatchRollout,
     dmd: DMDTensors,
     punti_per_snapshot: int | None = None,
+    indici_punti: torch.Tensor | None = None,
 ) -> torch.Tensor:
     numero_punti = batch.u0.shape[-2]
     if dmd.matrix.shape[-2:] != (numero_punti, numero_punti):
@@ -522,10 +832,15 @@ def loss_dmd_rollout(
     if punti_per_snapshot is not None and punti_per_snapshot < numero_punti:
         if punti_per_snapshot < 1:
             raise ValueError("punti_per_snapshot deve essere positivo oppure None.")
-        indici_punti = torch.randperm(
-            numero_punti,
-            device=successivi_dmd.device,
-        )[:punti_per_snapshot]
+        if indici_punti is None:
+            indici_punti = torch.linspace(
+                0,
+                numero_punti - 1,
+                punti_per_snapshot,
+                device=successivi_dmd.device,
+            ).round().long()
+        else:
+            indici_punti = indici_punti.to(device=successivi_dmd.device, dtype=torch.long)
         successivi_dmd = successivi_dmd.index_select(dim=-1, index=indici_punti)
         stati_successivi = stati_successivi.index_select(dim=-1, index=indici_punti)
 
@@ -544,22 +859,54 @@ def crea_esperimento(
 
     device = risolvi_device(configurazione.device)
     rng = np.random.default_rng(configurazione.seed)
+    qmc = CampionatoreQuasiMonteCarlo(configurazione.seed)
 
     train_dataset = DynabenchRolloutDataset(configurazione, split="train")
     val_dataset = DynabenchRolloutDataset(configurazione, split="val")
+    if configurazione.model_architecture == "cnn" and configurazione.lambda_fisica != 0.0:
+        raise ValueError(
+            "La loss fisica pointwise non e' supportata con model_architecture='cnn'. "
+            "Usa --lambda-fisica 0 oppure --model pinn."
+        )
 
     source = dmd_operator if dmd_operator is not None else configurazione.dmd_operator_path
-    dmd_provider = DMDOperatorProvider(source, cache_size=configurazione.dmd_cache_size)
+    dmd_factory = None
+    allow_missing_dmd_directory = False
+    if (
+        configurazione.lambda_dmd != 0.0
+        and configurazione.dmd_auto_generate
+        and _dmd_source_supports_auto_generation(source)
+    ):
+        dmd_factory = KoopmanPIDMDOperatorFactory(
+            out_dir=Path(source),
+            configurazione=configurazione,
+            split="train",
+        )
+        allow_missing_dmd_directory = True
+
+    dmd_provider = DMDOperatorProvider(
+        source,
+        cache_size=configurazione.dmd_cache_size,
+        missing_operator_factory=dmd_factory,
+        allow_missing_directory=allow_missing_dmd_directory,
+    )
+    dmd_operator_apprendibile = None
     if configurazione.lambda_dmd != 0.0 and not dmd_provider.has_operator:
-        if dmd_provider.missing_path is not None:
-            raise ValueError(
-                "La loss DMD ha peso diverso da zero, ma non trovo gli operatori "
-                f"piDMD in {dmd_provider.missing_path}. Generali dal notebook "
-                "Copia 05 oppure con: python koopman_pidmd.py --split train"
+        dmd_operator_apprendibile = torch.nn.Parameter(
+            torch.eye(
+                train_dataset.numero_punti,
+                device=device,
+                dtype=torch.float32,
             )
-        raise ValueError(
-            "La loss DMD ha peso diverso da zero, quindi devi fornire una matrice "
-            "con dmd_operator=... oppure --dmd-operator PERCORSO."
+        )
+        sorgente_mancante = (
+            f" in {dmd_provider.missing_path}"
+            if dmd_provider.missing_path is not None
+            else ""
+        )
+        print(
+            "Avviso: operatori piDMD non trovati"
+            f"{sorgente_mancante}. Uso un operatore DMD globale apprendibile."
         )
     if configurazione.lambda_dmd != 0.0 and configurazione.batch_size_dmd < 1:
         raise ValueError("batch_size_dmd deve essere almeno 1 quando lambda_dmd != 0.")
@@ -573,35 +920,65 @@ def crea_esperimento(
         numero_sim_train = int(sum(train_dataset.iterator.number_of_simulations))
         numero_operatori = dmd_provider.operator_count()
         if numero_operatori < numero_sim_train:
-            raise ValueError(
-                "Gli operatori piDMD sono incompleti: "
-                f"trovati {numero_operatori}, richiesti {numero_sim_train}. "
-                "Genera l'intero split train con: "
-                "python koopman_pidmd.py --split train --out-dir results/per_sim_final"
-            )
+            if dmd_provider.can_generate_missing:
+                print(
+                    "Operatori piDMD incompleti: "
+                    f"trovati {numero_operatori}, richiesti {numero_sim_train}. "
+                    "I file mancanti verranno generati e salvati quando richiesti."
+                )
+            else:
+                raise ValueError(
+                    "Gli operatori piDMD sono incompleti: "
+                    f"trovati {numero_operatori}, richiesti {numero_sim_train}. "
+                    "Genera l'intero split train con: "
+                    "python koopman_pidmd.py --split train --out-dir results/per_sim_final"
+                )
 
-    modello = PINN(
-        input_dim=3 + configurazione.lookback,
-        output_dim=1,
-        hidden_dim=configurazione.hidden_dim,
-        num_layers=configurazione.num_layers,
-        dropout=configurazione.dropout,
-    ).to(device)
-    optimizer = torch.optim.AdamW(
-        modello.parameters(),
-        lr=configurazione.learning_rate,
-        weight_decay=configurazione.weight_decay,
-    )
+    if configurazione.model_architecture == "cnn":
+        modello = AdvectionCNN(
+            lookback=configurazione.lookback,
+            rollout=configurazione.rollout,
+            grid_points=torch.as_tensor(train_dataset.grid_points, dtype=torch.float32),
+            grid_shape=train_dataset.grid_shape,
+            hidden_dim=configurazione.hidden_dim,
+            num_layers=configurazione.num_layers,
+            dropout=configurazione.dropout,
+            interpolation_neighbors=configurazione.cnn_interpolation_neighbors,
+            use_coordinates=configurazione.cnn_use_coordinates,
+        ).to(device)
+    elif configurazione.model_architecture == "pinn":
+        modello = PINN(
+            input_dim=3 + configurazione.lookback,
+            output_dim=1,
+            hidden_dim=configurazione.hidden_dim,
+            num_layers=configurazione.num_layers,
+            dropout=configurazione.dropout,
+        ).to(device)
+    else:
+        raise ValueError(
+            "model_architecture non supportata: "
+            f"{configurazione.model_architecture!r}. Usa 'cnn' oppure 'pinn'."
+        )
+    parametri_ottimizzazione = list(modello.parameters())
+    if dmd_operator_apprendibile is not None:
+        parametri_ottimizzazione.append(dmd_operator_apprendibile)
+
+    optimizer = costruisci_optimizer(parametri_ottimizzazione, configurazione)
+    scheduler = costruisci_scheduler(optimizer, configurazione)
 
     return {
         "configurazione": configurazione,
         "device": device,
         "rng": rng,
+        "qmc": qmc,
         "train_dataset": train_dataset,
         "val_dataset": val_dataset,
         "modello": modello,
         "optimizer": optimizer,
+        "scheduler": scheduler,
+        "scheduler_step": 0,
         "dmd_provider": dmd_provider,
+        "dmd_operator_apprendibile": dmd_operator_apprendibile,
     }
 
 
@@ -609,13 +986,22 @@ def step_training(esperimento: dict[str, Any]) -> dict[str, float]:
     configurazione: ConfigurazioneEsperimento = esperimento["configurazione"]
     device: torch.device = esperimento["device"]
     rng: np.random.Generator = esperimento["rng"]
+    qmc: CampionatoreQuasiMonteCarlo = esperimento["qmc"]
     train_dataset: DynabenchRolloutDataset = esperimento["train_dataset"]
     modello: torch.nn.Module = esperimento["modello"]
     optimizer: torch.optim.Optimizer = esperimento["optimizer"]
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = esperimento["scheduler"]
     dmd_provider: DMDOperatorProvider = esperimento["dmd_provider"]
+    dmd_operator_apprendibile: torch.nn.Parameter | None = esperimento["dmd_operator_apprendibile"]
 
     modello.train()
-    batch = train_dataset.sample_batch(rng, configurazione.batch_size, device)
+    batch = train_dataset.sample_batch(
+        rng,
+        configurazione.batch_size,
+        device,
+        qmc=qmc,
+        stream="train_data",
+    )
 
     optimizer.zero_grad(set_to_none=True)
     fisica_attiva = configurazione.lambda_fisica != 0.0
@@ -628,6 +1014,8 @@ def step_training(esperimento: dict[str, Any]) -> dict[str, float]:
     loss_data = torch.mean((pred_rollout - batch.target) ** 2)
 
     if fisica_attiva:
+        if features is None:
+            raise ValueError("La loss fisica richiede feature pointwise; usa --model pinn.")
         loss_fisica = loss_fisica_avvezione(
             pred_rollout.reshape(-1, 1),
             features,
@@ -637,19 +1025,43 @@ def step_training(esperimento: dict[str, Any]) -> dict[str, float]:
         loss_fisica = loss_data.new_zeros(())
 
     if configurazione.lambda_dmd != 0.0:
-        batch_dmd = train_dataset.sample_batch(rng, configurazione.batch_size_dmd, device)
+        batch_dmd = train_dataset.sample_batch(
+            rng,
+            configurazione.batch_size_dmd,
+            device,
+            qmc=qmc,
+            stream="train_dmd",
+        )
         pred_dmd, _ = forward_rollout(
             modello,
             batch_dmd,
             configurazione,
             require_grad=False,
         )
-        dmd = dmd_provider.get_for_batch(batch_dmd, device=device, dtype=batch_dmd.target.dtype)
+        if dmd_operator_apprendibile is None:
+            dmd = dmd_provider.get_for_batch(batch_dmd, device=device, dtype=batch_dmd.target.dtype)
+        else:
+            dmd = DMDTensors(matrix=dmd_operator_apprendibile.to(dtype=batch_dmd.target.dtype))
+        indici_punti = None
+        if (
+            configurazione.dmd_punti_per_snapshot is not None
+            and configurazione.dmd_punti_per_snapshot < batch_dmd.u0.shape[-2]
+        ):
+            indici_punti = torch.as_tensor(
+                qmc.indici_unici(
+                    "train_dmd_points",
+                    batch_dmd.u0.shape[-2],
+                    configurazione.dmd_punti_per_snapshot,
+                ),
+                device=device,
+                dtype=torch.long,
+            )
         loss_dmd = loss_dmd_rollout(
             pred_dmd,
             batch_dmd,
             dmd,
             punti_per_snapshot=configurazione.dmd_punti_per_snapshot,
+            indici_punti=indici_punti,
         )
     else:
         loss_dmd = loss_data.new_zeros(())
@@ -663,12 +1075,16 @@ def step_training(esperimento: dict[str, Any]) -> dict[str, float]:
     if configurazione.clip_grad_norm is not None:
         torch.nn.utils.clip_grad_norm_(modello.parameters(), configurazione.clip_grad_norm)
     optimizer.step()
+    if scheduler is not None and esperimento["scheduler_step"] < configurazione.numero_valutazioni_training:
+        scheduler.step()
+        esperimento["scheduler_step"] += 1
 
     return {
         "loss_totale": float(loss_totale.detach().cpu()),
         "loss_data": float(loss_data.detach().cpu()),
         "loss_fisica": float(loss_fisica.detach().cpu()),
         "loss_dmd": float(loss_dmd.detach().cpu()),
+        "learning_rate": float(optimizer.param_groups[0]["lr"]),
     }
 
 
@@ -676,11 +1092,17 @@ def step_training(esperimento: dict[str, Any]) -> dict[str, float]:
 def valida(esperimento: dict[str, Any], numero_batch: int | None = None) -> dict[str, float]:
     configurazione: ConfigurazioneEsperimento = esperimento["configurazione"]
     device: torch.device = esperimento["device"]
-    rng: np.random.Generator = esperimento["rng"]
     val_dataset: DynabenchRolloutDataset = esperimento["val_dataset"]
     modello: torch.nn.Module = esperimento["modello"]
 
-    numero_batch = configurazione.validation_batches if numero_batch is None else numero_batch
+    if numero_batch is None:
+        numero_batch = configurazione.validation_batches
+    if numero_batch == 0:
+        numero_batch = None
+    numero_finestre = len(val_dataset)
+    if numero_batch is not None:
+        numero_finestre = min(numero_finestre, numero_batch * configurazione.batch_validation)
+
     modello.eval()
     somma_quadrati_per_tempo = torch.zeros(
         configurazione.rollout,
@@ -688,8 +1110,13 @@ def valida(esperimento: dict[str, Any], numero_batch: int | None = None) -> dict
         dtype=torch.float64,
     )
     elementi_per_tempo = 0
-    for _ in range(numero_batch):
-        batch = val_dataset.sample_batch(rng, configurazione.batch_validation, device)
+    for inizio in range(0, numero_finestre, configurazione.batch_validation):
+        fine = min(inizio + configurazione.batch_validation, numero_finestre)
+        indici = np.arange(inizio, fine, dtype=np.int64)
+        batch = val_dataset.batch_da_indici(
+            indici,
+            device=device,
+        )
         pred_rollout, _ = forward_rollout(modello, batch, configurazione, require_grad=False)
         differenza = pred_rollout - batch.target
         somma_quadrati_per_tempo += torch.sum((differenza.double() ** 2), dim=(0, 2))
@@ -699,6 +1126,7 @@ def valida(esperimento: dict[str, Any], numero_batch: int | None = None) -> dict
     metriche = {
         "validation_mse_mean": float(torch.mean(mse_per_tempo).detach().cpu()),
         "validation_mse_rollout16": float(torch.mean(mse_per_tempo).detach().cpu()),
+        "validation_windows": float(numero_finestre),
     }
     for indice, valore in enumerate(mse_per_tempo.detach().cpu().tolist(), start=1):
         metriche[f"validation_mse_step_{indice:02d}"] = float(valore)
@@ -708,7 +1136,7 @@ def valida(esperimento: dict[str, Any], numero_batch: int | None = None) -> dict
 def allena(
     esperimento: dict[str, Any],
     numero_valutazioni: int | None = None,
-    stampa_ogni: int = 100,
+    stampa_ogni: int = 50,
     valida_ogni: int = 500,
 ) -> list[dict[str, float]]:
     configurazione: ConfigurazioneEsperimento = esperimento["configurazione"]
@@ -720,7 +1148,7 @@ def allena(
         metriche = step_training(esperimento)
         metriche["valutazione"] = float(valutazione)
 
-        if valutazione == 1 or (valida_ogni > 0 and valutazione % valida_ogni == 0):
+        if valida_ogni > 0 and valutazione % valida_ogni == 0:
             metriche.update(valida(esperimento))
             stampa_validation_terminal(metriche, valutazione, numero_valutazioni)
 
@@ -731,7 +1159,8 @@ def allena(
                 f"loss={metriche['loss_totale']:.6e} "
                 f"data={metriche['loss_data']:.6e} "
                 f"fisica={metriche['loss_fisica']:.6e} "
-                f"dmd={metriche['loss_dmd']:.6e}"
+                f"dmd={metriche['loss_dmd']:.6e} "
+                f"lr={metriche['learning_rate']:.3e}"
             )
             if "validation_mse_rollout16" in metriche:
                 messaggio += f" val_mse16={metriche['validation_mse_rollout16']:.6e}"
@@ -753,17 +1182,15 @@ def stampa_validation_terminal(
     print(
         f"\nValidation [{valutazione:05d}/{numero_valutazioni}] "
         f"mean={metriche['validation_mse_mean']:.6e} "
+        f"windows={int(metriche['validation_windows'])} "
         f"t+1={valori[0]:.6e} "
         f"t+{len(valori)}={valori[-1]:.6e} "
         f"min={min(valori):.6e} "
         f"max={max(valori):.6e}"
     )
-    print("  MSE per rollout step:")
-    for start in range(0, len(valori), 4):
-        pezzi = []
-        for offset, valore in enumerate(valori[start:start + 4], start=start + 1):
-            pezzi.append(f"t+{offset:02d}={valore:.3e}")
-        print("    " + "  ".join(pezzi))
+    print("  MSE validation per t di rollout:")
+    for offset, valore in enumerate(valori, start=1):
+        print(f"    t+{offset:02d}: {valore:.6e}")
     print()
 
 
@@ -884,47 +1311,118 @@ def descrivi_esperimento(esperimento: dict[str, Any]) -> None:
     train_dataset: DynabenchRolloutDataset = esperimento["train_dataset"]
     val_dataset: DynabenchRolloutDataset = esperimento["val_dataset"]
     device: torch.device = esperimento["device"]
+    dmd_provider: DMDOperatorProvider = esperimento["dmd_provider"]
+    dmd_operator_apprendibile = esperimento["dmd_operator_apprendibile"]
 
-    print("Esperimento PINN/DMD su Dynabench advection")
+    print("Esperimento su Dynabench advection")
     print(f"Device: {device}")
+    print(
+        "Modello: "
+        f"{configurazione.model_architecture}, "
+        f"hidden_dim={configurazione.hidden_dim}, "
+        f"num_layers={configurazione.num_layers}, "
+        f"dropout={configurazione.dropout}"
+    )
+    if configurazione.model_architecture == "cnn":
+        print(
+            "CNN cloud->grid: "
+            f"griglia={train_dataset.grid_shape[0]}x{train_dataset.grid_shape[1]}, "
+            f"vicini IDW={configurazione.cnn_interpolation_neighbors}, "
+            f"coordinate={configurazione.cnn_use_coordinates}"
+        )
     print("Dominio spaziale: [0, 1] x [0, 1]")
     print(f"Dominio temporale: [{configurazione.t0}, {configurazione.t_finale}]")
     print(f"Iterator train: lookback={configurazione.lookback}, rollout={configurazione.rollout}")
     print(f"Finestre train: {len(train_dataset)}")
     print(f"Finestre val: {len(val_dataset)}")
+    if configurazione.validation_batches is None or configurazione.validation_batches == 0:
+        print("Validation: dataset val completo, sequenziale")
+    else:
+        finestre_validation = min(
+            len(val_dataset),
+            configurazione.validation_batches * configurazione.batch_validation,
+        )
+        print(f"Validation: prime {finestre_validation} finestre del dataset val")
     print(f"Punti cloud per snapshot: {train_dataset.numero_punti}")
-    punti_dmd = (
-        train_dataset.numero_punti
-        if configurazione.dmd_punti_per_snapshot is None
-        else min(configurazione.dmd_punti_per_snapshot, train_dataset.numero_punti)
-    )
     print(
-        "Collocation DMD per step: "
-        f"{configurazione.batch_size_dmd} finestre x "
+        "Data loss per step: "
+        f"{configurazione.batch_size} finestre x "
         f"{configurazione.rollout} tempi x "
-        f"{punti_dmd} punti"
+        f"{train_dataset.numero_punti} punti"
     )
+    if configurazione.lambda_dmd != 0.0:
+        punti_dmd = (
+            train_dataset.numero_punti
+            if configurazione.dmd_punti_per_snapshot is None
+            else min(configurazione.dmd_punti_per_snapshot, train_dataset.numero_punti)
+        )
+        print(
+            "Collocation DMD per step: "
+            f"{configurazione.batch_size_dmd} finestre x "
+            f"{configurazione.rollout} tempi x "
+            f"{punti_dmd} punti"
+        )
+    else:
+        print("Collocation DMD per step: disattivata")
     print(f"Griglia dynabench.grid: {train_dataset.griglia_dominio}")
+    print(
+        "Campionamento: Sobol quasi-Monte Carlo su finestre "
+        "Dynabench, con dimensioni separate per simulazioni e tempi; "
+        "ogni finestra usa tutti i punti spaziali del cloud."
+    )
     print(
         "Pesi loss: "
         f"data={configurazione.lambda_data}, "
         f"fisica={configurazione.lambda_fisica}, "
         f"dmd={configurazione.lambda_dmd}"
     )
+    print(
+        "Optimizer: "
+        f"{configurazione.optimizer_name}, "
+        f"max_lr={configurazione.learning_rate}, "
+        f"weight_decay={configurazione.weight_decay}, "
+        f"betas=({configurazione.adam_beta1}, {configurazione.adam_beta2}), "
+        f"scheduler={configurazione.lr_scheduler}, "
+        f"clip_grad_norm={configurazione.clip_grad_norm}"
+    )
+    if configurazione.lambda_dmd != 0.0:
+        sorgente_dmd = (
+            "operatore globale apprendibile"
+            if dmd_operator_apprendibile is not None
+            else (
+                "operatori piDMD da file, con generazione automatica dei mancanti"
+                if dmd_provider.can_generate_missing
+                else "operatori piDMD caricati da file"
+            )
+        )
+        print(f"Sorgente DMD: {sorgente_dmd}")
     print(f"Valutazioni training: {configurazione.numero_valutazioni_training}")
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Training PINN su Dynabench advection (lookback=1, rollout=16).")
+    parser = argparse.ArgumentParser(description="Training su Dynabench advection (lookback=1, rollout=16).")
     parser.add_argument("--dmd-operator", help="File .npy/.npz/.pt/.csv o directory di operatori per-simulazione.")
+    parser.add_argument("--dmd-svd-rank", type=int, help="Rank SVD usato per generare operatori piDMD mancanti.")
+    parser.add_argument("--no-dmd-auto-generate", action="store_true", help="Disabilita la generazione automatica degli operatori piDMD mancanti.")
     parser.add_argument("--evals", type=int, help="Numero di valutazioni/step di training.")
     parser.add_argument("--batch-size", type=int, help="Batch size train in finestre Dynabench.")
     parser.add_argument("--batch-size-dmd", type=int, help="Finestre Dynabench usate solo per la DMD loss.")
-    parser.add_argument("--dmd-punti-per-snapshot", type=int, help="Punti spaziali usati nella DMD loss; 225 usa tutto.")
-    parser.add_argument("--validation-batches", type=int, help="Numero batch usati per la validation.")
+    parser.add_argument("--dmd-punti-per-snapshot", type=int, help="Punti spaziali usati nella DMD loss; se omesso usa tutta la griglia.")
+    parser.add_argument("--validation-batches", type=int, help="Limita il numero di batch sequenziali usati per la validation; 0 usa tutto il dataset val.")
     parser.add_argument("--batch-validation", type=int, help="Batch size validation in finestre Dynabench.")
     parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0 oppure auto.")
-    parser.add_argument("--print-every", type=int, default=100)
+    parser.add_argument("--model", choices=["cnn", "pinn"], help="Architettura del modello.")
+    parser.add_argument("--hidden-dim", type=int, help="Canali CNN o neuroni hidden della PINN.")
+    parser.add_argument("--num-layers", type=int, help="Blocchi residuali CNN o layer hidden della PINN.")
+    parser.add_argument("--dropout", type=float, help="Dropout del modello.")
+    parser.add_argument("--cnn-neighbors", type=int, help="Numero di vicini IDW per interpolare cloud e griglia.")
+    parser.add_argument("--no-cnn-coordinates", action="store_true", help="Non aggiunge canali coordinate x/y alla CNN.")
+    parser.add_argument("--optimizer", choices=["adamw_amsgrad", "adamw"], help="Ottimizzatore usato per il modello.")
+    parser.add_argument("--learning-rate", type=float, help="Learning rate massimo; con onecycle e' il max_lr.")
+    parser.add_argument("--weight-decay", type=float, help="Weight decay dell'ottimizzatore.")
+    parser.add_argument("--lr-scheduler", choices=["onecycle", "none"], help="Scheduler del learning rate.")
+    parser.add_argument("--clip-grad-norm", type=float, help="Clipping L2 del gradiente; usa 0 per disattivarlo.")
+    parser.add_argument("--print-every", type=int, default=50)
     parser.add_argument("--validate-every", type=int, default=500)
     parser.add_argument("--save-model", help="Percorso .pt in cui salvare pesi e configurazione.")
     parser.add_argument("--history-csv", default="results/training_history.csv", help="CSV dello storico training/validation.")
@@ -941,6 +1439,10 @@ def main() -> None:
     configurazione = ConfigurazioneEsperimento(download=args.download)
     if args.dmd_operator is not None:
         configurazione = replace(configurazione, dmd_operator_path=args.dmd_operator)
+    if args.dmd_svd_rank is not None:
+        configurazione = replace(configurazione, dmd_svd_rank=args.dmd_svd_rank)
+    if args.no_dmd_auto_generate:
+        configurazione = replace(configurazione, dmd_auto_generate=False)
     if args.evals is not None:
         configurazione = replace(configurazione, numero_valutazioni_training=args.evals)
     if args.batch_size is not None:
@@ -955,6 +1457,31 @@ def main() -> None:
         configurazione = replace(configurazione, batch_validation=args.batch_validation)
     if args.device is not None:
         configurazione = replace(configurazione, device=args.device)
+    if args.model is not None:
+        configurazione = replace(configurazione, model_architecture=args.model)
+    if args.hidden_dim is not None:
+        configurazione = replace(configurazione, hidden_dim=args.hidden_dim)
+    if args.num_layers is not None:
+        configurazione = replace(configurazione, num_layers=args.num_layers)
+    if args.dropout is not None:
+        configurazione = replace(configurazione, dropout=args.dropout)
+    if args.cnn_neighbors is not None:
+        configurazione = replace(configurazione, cnn_interpolation_neighbors=args.cnn_neighbors)
+    if args.no_cnn_coordinates:
+        configurazione = replace(configurazione, cnn_use_coordinates=False)
+    if args.optimizer is not None:
+        configurazione = replace(configurazione, optimizer_name=args.optimizer)
+    if args.learning_rate is not None:
+        configurazione = replace(configurazione, learning_rate=args.learning_rate)
+    if args.weight_decay is not None:
+        configurazione = replace(configurazione, weight_decay=args.weight_decay)
+    if args.lr_scheduler is not None:
+        configurazione = replace(configurazione, lr_scheduler=args.lr_scheduler)
+    if args.clip_grad_norm is not None:
+        configurazione = replace(
+            configurazione,
+            clip_grad_norm=None if args.clip_grad_norm == 0 else args.clip_grad_norm,
+        )
     if args.lambda_data is not None:
         configurazione = replace(configurazione, lambda_data=args.lambda_data)
     if args.lambda_fisica is not None:
@@ -982,6 +1509,11 @@ def main() -> None:
         torch.save(
             {
                 "model_state_dict": esperimento["modello"].state_dict(),
+                "dmd_operator_apprendibile": (
+                    esperimento["dmd_operator_apprendibile"].detach().cpu()
+                    if esperimento["dmd_operator_apprendibile"] is not None
+                    else None
+                ),
                 "configurazione": configurazione.__dict__,
                 "storico": storico,
             },

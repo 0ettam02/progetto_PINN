@@ -81,17 +81,42 @@ Lo script salva file del tipo:
 results/per_sim_final/koopman_pidmd_r58_sim00000.npz
 ```
 
-`esperimento.py` usa questa directory come sorgente DMD di default.
-
-Esempio di training con lookback 1, fisica differenziale spenta e piu' finestre
-per il vincolo DMD:
+`esperimento.py` ha `lambda_dmd=0` di default, quindi il vincolo DMD e' spento
+nel training principale. Se lo riattivi con `--lambda-dmd 1`, usa questa
+directory come sorgente DMD di default. Se durante
+il training manca un operatore per una simulazione richiesta, lo genera con la
+stessa pipeline del notebook `Copia_di_05_koopman_pidmd_pipeline_FINAL.ipynb`
+e lo salva nella directory DMD. Per disattivare questo comportamento:
 
 ```bash
-python esperimento.py --evals 5000 --batch-size 4 --batch-size-dmd 10 --dmd-punti-per-snapshot 100 --save-model results/pinn_advection.pt
+python esperimento.py --lambda-dmd 1 --no-dmd-auto-generate
 ```
 
-Se `--lambda-fisica 0`, il termine PDE viene spento e non viene calcolata la
-differenziazione automatica sui collocation point fisici.
+Esempio di training principale con modello CNN full-field, fisica
+differenziale spenta, DMD spenta e ottimizzazione AdamW/AMSGrad con OneCycleLR:
 
-La DMD resta calcolata con l'operatore completo `225x225`, ma la loss viene
-mediata solo sui punti indicati da `--dmd-punti-per-snapshot`.
+```bash
+python esperimento.py --evals 5000 --save-model results/cnn_advection.pt
+```
+
+Il default usa `--model cnn`: i 225 punti cloud vengono interpolati su una
+griglia regolare `15x15`, la CNN predice i 16 step futuri sulla griglia, poi
+l'output viene riportato sui punti cloud per calcolare la loss. La vecchia PINN
+pointwise resta disponibile con:
+
+```bash
+python esperimento.py --model pinn
+```
+
+Con `--model cnn` tieni `--lambda-fisica 0`, perche' il termine PDE pointwise
+richiede la vecchia architettura PINN.
+
+L'ottimizzatore di default usa `adamw_amsgrad`, `max_lr=1e-3`,
+`weight_decay=1e-5`, `betas=(0.9, 0.99)`, scheduler `onecycle`, clipping del
+gradiente a `1.0`, `batch_size=32`, CNN con `64` canali e `6` blocchi
+residuali. Puoi cambiarli da CLI con `--optimizer`, `--learning-rate`,
+`--weight-decay`, `--lr-scheduler`, `--clip-grad-norm`, `--hidden-dim`,
+`--num-layers`, `--dropout` e `--cnn-neighbors`.
+
+Se riattivi la DMD, resta calcolata con l'operatore completo `225x225`, ma la
+loss viene mediata solo sui punti indicati da `--dmd-punti-per-snapshot`.

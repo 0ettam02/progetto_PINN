@@ -2,6 +2,172 @@ import torch
 import torch.nn as nn
 
 
+def _group_norm_groups(channels: int) -> int:
+    groups = min(8, channels)
+    while channels % groups != 0:
+        groups -= 1
+    return groups
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int, dropout: float = 0.0):
+        super().__init__()
+        if channels < 1:
+            raise ValueError("channels deve essere positivo.")
+        if dropout < 0.0 or dropout >= 1.0:
+            raise ValueError("dropout deve essere in [0, 1).")
+
+        groups = _group_norm_groups(channels)
+        layers: list[nn.Module] = [
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode="circular"),
+            nn.GroupNorm(groups, channels),
+            nn.SiLU(),
+        ]
+        if dropout > 0.0:
+            layers.append(nn.Dropout2d(p=dropout))
+        layers.extend(
+            [
+                nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode="circular"),
+                nn.GroupNorm(groups, channels),
+            ]
+        )
+        self.net = nn.Sequential(*layers)
+        self.activation = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(x + self.net(x))
+
+
+class AdvectionCNN(nn.Module):
+    """Residual CNN per forecast full-field da cloud rasterizzato su griglia regolare."""
+
+    def __init__(
+        self,
+        lookback: int,
+        rollout: int,
+        grid_points: torch.Tensor,
+        grid_shape: tuple[int, int],
+        hidden_dim: int = 64,
+        num_layers: int = 6,
+        dropout: float = 0.0,
+        interpolation_neighbors: int = 8,
+        use_coordinates: bool = True,
+    ):
+        super().__init__()
+        if lookback < 1:
+            raise ValueError("lookback deve essere almeno 1.")
+        if rollout < 1:
+            raise ValueError("rollout deve essere almeno 1.")
+        if num_layers < 1:
+            raise ValueError("num_layers deve essere almeno 1.")
+        if interpolation_neighbors < 1:
+            raise ValueError("interpolation_neighbors deve essere positivo.")
+
+        grid_points = torch.as_tensor(grid_points, dtype=torch.float32)
+        expected_points = int(grid_shape[0] * grid_shape[1])
+        if grid_points.shape != (expected_points, 2):
+            raise ValueError(
+                "grid_points deve avere shape "
+                f"({expected_points}, 2), ricevuta {tuple(grid_points.shape)}."
+            )
+
+        self.lookback = lookback
+        self.rollout = rollout
+        self.grid_shape = grid_shape
+        self.interpolation_neighbors = interpolation_neighbors
+        self.use_coordinates = use_coordinates
+        self.register_buffer("grid_points", grid_points)
+
+        in_channels = lookback + (2 if use_coordinates else 0)
+        self.lift = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1, padding_mode="circular"),
+            nn.GroupNorm(_group_norm_groups(hidden_dim), hidden_dim),
+            nn.SiLU(),
+        )
+        self.blocks = nn.Sequential(
+            *[ResidualConvBlock(hidden_dim, dropout=dropout) for _ in range(num_layers)]
+        )
+        self.head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, rollout, kernel_size=1),
+        )
+
+    def forward(self, grid_state: torch.Tensor) -> torch.Tensor:
+        x = self._append_coordinates(grid_state)
+        features = self.blocks(self.lift(x))
+        delta = self.head(features)
+        persistence = grid_state[:, -1:, :, :].expand(-1, self.rollout, -1, -1)
+        return persistence + delta
+
+    def forward_cloud(self, u0: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        grid_state = self.cloud_to_grid(u0.transpose(1, 2), pos)
+        pred_grid = self.forward(grid_state)
+        return self.grid_to_cloud(pred_grid, pos)
+
+    def cloud_to_grid(self, values: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        interpolated = self._idw_interpolate(
+            values=values,
+            source_points=pos,
+            target_points=self.grid_points,
+        )
+        batch_size, channels, _ = interpolated.shape
+        height, width = self.grid_shape
+        return interpolated.reshape(batch_size, channels, height, width)
+
+    def grid_to_cloud(self, grid_values: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, height, width = grid_values.shape
+        if (height, width) != self.grid_shape:
+            raise ValueError(
+                f"grid_values ha shape spaziale {(height, width)}, attesa {self.grid_shape}."
+            )
+        flat_values = grid_values.reshape(batch_size, channels, height * width)
+        return self._idw_interpolate(
+            values=flat_values,
+            source_points=self.grid_points,
+            target_points=pos,
+        )
+
+    def _append_coordinates(self, grid_state: torch.Tensor) -> torch.Tensor:
+        if not self.use_coordinates:
+            return grid_state
+        height, width = self.grid_shape
+        coords = self.grid_points.T.reshape(1, 2, height, width)
+        coords = coords.to(device=grid_state.device, dtype=grid_state.dtype)
+        coords = coords.expand(grid_state.shape[0], -1, -1, -1)
+        return torch.cat([grid_state, coords], dim=1)
+
+    def _idw_interpolate(
+        self,
+        values: torch.Tensor,
+        source_points: torch.Tensor,
+        target_points: torch.Tensor,
+    ) -> torch.Tensor:
+        if source_points.ndim == 2:
+            source_points = source_points.unsqueeze(0).expand(values.shape[0], -1, -1)
+        if target_points.ndim == 2:
+            target_points = target_points.unsqueeze(0).expand(values.shape[0], -1, -1)
+
+        source_points = source_points.to(device=values.device, dtype=values.dtype)
+        target_points = target_points.to(device=values.device, dtype=values.dtype)
+        neighbors = min(self.interpolation_neighbors, source_points.shape[1])
+
+        distances = torch.cdist(target_points, source_points)
+        nearest_dist, nearest_idx = torch.topk(
+            distances,
+            k=neighbors,
+            dim=-1,
+            largest=False,
+        )
+        weights = torch.reciprocal(torch.clamp(nearest_dist, min=1e-6) ** 2)
+        weights = weights / torch.sum(weights, dim=-1, keepdim=True)
+
+        expanded_values = values[:, :, None, :].expand(-1, -1, target_points.shape[1], -1)
+        expanded_idx = nearest_idx[:, None, :, :].expand(-1, values.shape[1], -1, -1)
+        gathered = torch.gather(expanded_values, dim=-1, index=expanded_idx)
+        return torch.sum(gathered * weights[:, None, :, :], dim=-1)
+
+
 def loss_toeplitz(A: torch.Tensor) -> torch.Tensor:
     """Differentiable penalty for the distance of a matrix from Toeplitz form."""
     if not isinstance(A, torch.Tensor):
