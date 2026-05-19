@@ -66,57 +66,36 @@ Requisiti aggiuntivi:
 - `matplotlib`
 - `h5py` (solo se si vogliono aprire file .h5)
 
-## Operatori Koopman-piDMD per la loss DMD
+## Esperimento PINN minimale
 
-La loss DMD usa gli operatori generati dal notebook
-`Copia_di_05_koopman_pidmd_pipeline_FINAL.ipynb`. Per rigenerarli da script:
+`esperimento.py` e' minimale: carica solo la prima simulazione Dynabench
+`cloud/high` dello split train, allena la PINN con condizione iniziale,
+periodicita' del dominio, fisica dell'advection e, se attivata, loss DMD, e
+stampa una validation MSE su 200 punti Dynabench campionati dalla simulazione.
+Se i file `cloud/high` non sono presenti in `data/`, lo script prova a
+scaricarli automaticamente.
 
-```bash
-python koopman_pidmd.py --split train --out-dir results/per_sim_final
-```
+La loss iniziale/bordo e' la somma tra lo snapshot iniziale e i vincoli
+periodici `u(0,y,t)=u(1,y,t)` e `u(x,0,t)=u(x,1,t)`.
+La condizione iniziale usa tutti i punti disponibili del primo snapshot
+Dynabench high resolution e viene calcolata sui punti reali `sample.pos`, senza
+ricostruire una griglia fittizia.
 
-Lo script salva file del tipo:
+La DMD loss e' disattivata di default per evitare di usare operatori low
+resolution sui punti high. Se la riattivi con `--lambda-dmd 1`, passa un
+operatore DMD coerente con high resolution tramite `--dmd-operator`.
 
-```text
-results/per_sim_final/koopman_pidmd_r58_sim00000.npz
-```
-
-`esperimento.py` ha `lambda_dmd=0` di default, quindi il vincolo DMD e' spento
-nel training principale. Se lo riattivi con `--lambda-dmd 1`, usa questa
-directory come sorgente DMD di default. Se durante
-il training manca un operatore per una simulazione richiesta, lo genera con la
-stessa pipeline del notebook `Copia_di_05_koopman_pidmd_pipeline_FINAL.ipynb`
-e lo salva nella directory DMD. Per disattivare questo comportamento:
-
-```bash
-python esperimento.py --lambda-dmd 1 --no-dmd-auto-generate
-```
-
-Esempio di training principale con modello CNN full-field, fisica
-differenziale spenta, DMD spenta e ottimizzazione AdamW/AMSGrad con OneCycleLR:
+Esempio:
 
 ```bash
-python esperimento.py --evals 5000 --save-model results/cnn_advection.pt
+python esperimento.py --evals 100 --save-model results/pinn_sim000.pt
 ```
 
-Il default usa `--model cnn`: i 225 punti cloud vengono interpolati su una
-griglia regolare `15x15`, la CNN predice i 16 step futuri sulla griglia, poi
-l'output viene riportato sui punti cloud per calcolare la loss. La vecchia PINN
-pointwise resta disponibile con:
+Di default esegue 100 iterazioni, stampa ogni 10 iterazioni e valida ogni 10
+iterazioni. L'early stopping controlla `validation_mse_200` e si ferma dopo 20
+validation senza miglioramento. Puoi cambiare la densita' dei punti PDE, dei
+punti periodici, delle transizioni DMD, della validation e la pazienza:
 
 ```bash
-python esperimento.py --model pinn
+python esperimento.py --batch-collocation 16384 --batch-periodic 4096 --batch-dmd 16 --validation-points 200 --early-stopping-patience 20
 ```
-
-Con `--model cnn` tieni `--lambda-fisica 0`, perche' il termine PDE pointwise
-richiede la vecchia architettura PINN.
-
-L'ottimizzatore di default usa `adamw_amsgrad`, `max_lr=1e-3`,
-`weight_decay=1e-5`, `betas=(0.9, 0.99)`, scheduler `onecycle`, clipping del
-gradiente a `1.0`, `batch_size=32`, CNN con `64` canali e `6` blocchi
-residuali. Puoi cambiarli da CLI con `--optimizer`, `--learning-rate`,
-`--weight-decay`, `--lr-scheduler`, `--clip-grad-norm`, `--hidden-dim`,
-`--num-layers`, `--dropout` e `--cnn-neighbors`.
-
-Se riattivi la DMD, resta calcolata con l'operatore completo `225x225`, ma la
-loss viene mediata solo sui punti indicati da `--dmd-punti-per-snapshot`.

@@ -10,12 +10,10 @@ def _group_norm_groups(channels: int) -> int:
 
 
 class ResidualConvBlock(nn.Module):
-    def __init__(self, channels: int, dropout: float = 0.0):
+    def __init__(self, channels: int):
         super().__init__()
         if channels < 1:
             raise ValueError("channels deve essere positivo.")
-        if dropout < 0.0 or dropout >= 1.0:
-            raise ValueError("dropout deve essere in [0, 1).")
 
         groups = _group_norm_groups(channels)
         layers: list[nn.Module] = [
@@ -23,8 +21,6 @@ class ResidualConvBlock(nn.Module):
             nn.GroupNorm(groups, channels),
             nn.SiLU(),
         ]
-        if dropout > 0.0:
-            layers.append(nn.Dropout2d(p=dropout))
         layers.extend(
             [
                 nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode="circular"),
@@ -49,7 +45,6 @@ class AdvectionCNN(nn.Module):
         grid_shape: tuple[int, int],
         hidden_dim: int = 64,
         num_layers: int = 6,
-        dropout: float = 0.0,
         interpolation_neighbors: int = 8,
         use_coordinates: bool = True,
     ):
@@ -84,9 +79,7 @@ class AdvectionCNN(nn.Module):
             nn.GroupNorm(_group_norm_groups(hidden_dim), hidden_dim),
             nn.SiLU(),
         )
-        self.blocks = nn.Sequential(
-            *[ResidualConvBlock(hidden_dim, dropout=dropout) for _ in range(num_layers)]
-        )
+        self.blocks = nn.Sequential(*[ResidualConvBlock(hidden_dim) for _ in range(num_layers)])
         self.head = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
             nn.SiLU(),
@@ -168,34 +161,6 @@ class AdvectionCNN(nn.Module):
         return torch.sum(gathered * weights[:, None, :, :], dim=-1)
 
 
-def loss_toeplitz(A: torch.Tensor) -> torch.Tensor:
-    """Differentiable penalty for the distance of a matrix from Toeplitz form."""
-    if not isinstance(A, torch.Tensor):
-        raise TypeError("A deve essere un torch.Tensor.")
-    if A.ndim < 2:
-        raise ValueError("A deve avere almeno due dimensioni.")
-    if not (A.is_floating_point() or A.is_complex()):
-        raise TypeError("A deve avere dtype floating point o complesso.")
-
-    n_righe, n_colonne = A.shape[-2:]
-    if n_righe == 0 or n_colonne == 0:
-        raise ValueError("A deve avere righe e colonne non vuote.")
-
-    dtype_loss = A.real.dtype if A.is_complex() else A.dtype
-    scarto_quadratico = torch.zeros((), device=A.device, dtype=dtype_loss)
-    numero_elementi = 0
-
-    for k in range(1 - n_righe, n_colonne):
-        diagonale = torch.diagonal(A, offset=k, dim1=-2, dim2=-1)
-        media_diagonale = diagonale.mean(dim=-1, keepdim=True)
-        scarto_quadratico = scarto_quadratico + torch.sum(
-            torch.abs(diagonale - media_diagonale) ** 2
-        )
-        numero_elementi += diagonale.numel()
-
-    return scarto_quadratico / numero_elementi
-
-
 class PINN(nn.Module):
     def __init__(
         self,
@@ -203,25 +168,18 @@ class PINN(nn.Module):
         output_dim: int,
         hidden_dim: int = 64,
         num_layers: int = 4,
-        dropout: float = 0.0,
     ):
         super().__init__()
         if num_layers < 1:
             raise ValueError("num_layers deve essere almeno 1.")
-        if dropout < 0.0 or dropout >= 1.0:
-            raise ValueError("dropout deve essere in [0, 1).")
 
         layers: list[nn.Module] = []
         layers.append(nn.Linear(input_dim, hidden_dim))
         layers.append(nn.Tanh())
-        if dropout > 0.0:
-            layers.append(nn.Dropout(p=dropout))
 
         for _ in range(num_layers - 1):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             layers.append(nn.Tanh())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(p=dropout))
 
         layers.append(nn.Linear(hidden_dim, output_dim))
         self.net = nn.Sequential(*layers)
@@ -263,6 +221,33 @@ class PINN(nn.Module):
         y_pred = self.forward(x_data)
         return torch.mean((y_pred - y_data) ** 2)
 
+    def initial_boundary_loss(
+        self,
+        x_initial_boundary: torch.Tensor,
+        y_initial_boundary: torch.Tensor,
+    ) -> torch.Tensor:
+        y_pred = self.forward(x_initial_boundary)
+        return torch.mean((y_pred - y_initial_boundary) ** 2)
+
+    def boundary_condition_loss(
+        self,
+        x_initial: torch.Tensor,
+        y_initial: torch.Tensor,
+        x_periodic_left: torch.Tensor,
+        x_periodic_right: torch.Tensor,
+        y_periodic_bottom: torch.Tensor,
+        y_periodic_top: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        loss_initial = self.initial_boundary_loss(x_initial, y_initial)
+        loss_periodic_x = torch.mean(
+            (self.forward(x_periodic_left) - self.forward(x_periodic_right)) ** 2
+        )
+        loss_periodic_y = torch.mean(
+            (self.forward(y_periodic_bottom) - self.forward(y_periodic_top)) ** 2
+        )
+        loss_periodic = loss_periodic_x + loss_periodic_y
+        return loss_initial + loss_periodic, loss_initial, loss_periodic
+
     def dmd_loss(
         self,
         x_current: torch.Tensor,
@@ -277,8 +262,11 @@ class PINN(nn.Module):
         collocation_points: torch.Tensor,
         x_data: torch.Tensor,
         y_data: torch.Tensor,
+        x_initial_boundary: torch.Tensor,
+        y_initial_boundary: torch.Tensor,
         operatore_differenziale,
         fisica,
+        lambda_initial_boundary: float = 1.0,
         lambda_physics: float = 1.0,
         lambda_data: float = 1.0,
         dmd_current: torch.Tensor | None = None,
@@ -288,7 +276,15 @@ class PINN(nn.Module):
     ) -> torch.Tensor:
         loss_pde = self.physics_loss(collocation_points, operatore_differenziale, fisica)
         loss_data = self.data_loss(x_data, y_data)
-        loss_totale = lambda_physics * loss_pde + lambda_data * loss_data
+        loss_initial_boundary = self.initial_boundary_loss(
+            x_initial_boundary,
+            y_initial_boundary,
+        )
+        loss_totale = (
+            lambda_initial_boundary * loss_initial_boundary
+            + lambda_physics * loss_pde
+            + lambda_data * loss_data
+        )
 
         if lambda_dmd != 0.0:
             if dmd_current is None or dmd_next is None or dmd_operator is None:
